@@ -1,49 +1,43 @@
-# V9.2 validation log
+# V8.1.2 validation report
 
 ## Official checker
 
 Command:
 
 ```bash
-python3 /path/to/mechfight-kit/check/check.py --map-dir /path/to/arena -- python3 -u bot.py
+python3 check/check.py --map-dir /mnt/data/arena_extracted/arena -- python3 -u bot.py
 ```
 
-Result on the available local runtime:
+Result: **PASS**
 
-- 300 observations processed
-- 300 answers in time
-- 0 late answers
-- 0 stale/incorrect ticks
-- 0 bad lines
-- 0 debug drawing cap violations
-- p50 1.2 ms; p90 1.8 ms; p99 2.6 ms; max 3.2 ms
-- PASS
+- Observations: 300 / 300
+- Missed 50 ms deadlines: 0
+- Wrong ticks: 0
+- Invalid protocol lines: 0
+- Local timing: p50 0.7 ms / p90 1.3 ms / p99 1.8 ms / max 2.6 ms
 
-## Unit / integration tests
+## Regression tests
 
-```bash
-MECHFIGHT_ARENA=/path/to/arena python3 -m unittest \
-  test_v9_integrated.py test_v9_reference.py test_v9_tactical.py test_v9_2.py -v
-```
+`ARENA_DIR=/mnt/data/arena_extracted/arena ./run_tests.sh`
 
-Result: **23 tests passed**.
+Result: **19 / 19 PASS**.
 
-## Real-map navigation measurements
+Coverage includes third-party beam filtering and lightning polylines, zone waypoint safety and obstacle fallback, supply-drop stability/guards, mortar terrain and wall impact, target scoring, and laser range selection.
 
-- Static graph build: approximately 0.40–0.46 s.
-- Walkable cells: 2,120.
-- Directed edges: 12,920.
-- Long-route cached-graph A* max: approximately 1.4 ms.
+## Additional stress test
 
-## Full action stress test
+`_incoming_threat` called with 40 simulated mortar projectiles over 120 runs on the actual loaded OSU map:
 
-Synthetic observation: 15 mechs, 40 projectiles, beams, sounds, repeated stationary/stagnation condition. 100 `Bot.act()` calls:
+- p50: 6.019 ms
+- p90: 6.447 ms
+- p99: 12.322 ms
+- max: 14.481 ms
 
-- p50: 5.99 ms
-- p90: 6.48 ms
-- p99: 10.06 ms
-- max: 11.96 ms
+This is a targeted local stress scenario, not a full-agent worst-case guarantee.
 
-## Important limits
+## Caveats
 
-These are local measurements, not a Docker sandbox guarantee. No gameplay score has been measured. The official conformance checker does not simulate the results of actions.
+- Measurements are from this machine, not the competition's exact 1-CPU / 512 MB Docker sandbox.
+- Docker is unavailable in this environment, so image build and sandbox timing were not verified locally.
+- `check.py` is a protocol/timing conformance test, not a gameplay simulation.
+- V8.1.2 has not received a scored practice run. V8 remains the best-scoring verified version at 2.92 until a higher score is returned.

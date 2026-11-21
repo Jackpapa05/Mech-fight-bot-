@@ -18,6 +18,8 @@ def make_bot():
         "weapons": {"mortar": {"gravity": 22.0, "splash_radius": 7.0}},
         "projectile": {"gun_radius": 0.3, "npc_radius": 0.3},
     }
+    bot.terrain_values = None
+    bot.terrain_meta = {}
     bot.last_threat_t = -999.0
     bot.last_threat_bearing = None
     bot.last_attacker_bearing = None
