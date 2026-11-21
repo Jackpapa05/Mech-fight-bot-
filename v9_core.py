@@ -426,14 +426,24 @@ def unilateral_vo_danger(
 
 
 class CoarseNavGraph:
-    """16m coarse traversability grid built at hello; runs throttled A* only on steering stagnation."""
+    """Precomputed coarse traversability graph with cheap, bounded A* queries."""
+
+    NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1),
+                 (1, 1), (1, -1), (-1, 1), (-1, -1))
 
     def __init__(self, bot: Any, cell_size: float = 16.0) -> None:
-        self.cell_size = cell_size
+        self.cell_size = float(cell_size)
         self.last_replan_t: float = -999.0
         self.cached_waypoint: Optional[Vec2] = None
         self.cached_goal: Optional[Vec2] = None
         self.bot = bot
+        self.graph_ready = False
+        self.graph_radius = 4.0
+        self.graph_height = 9.0
+        self.walkable: set[Tuple[int, int]] = set()
+        self.heights: Dict[Tuple[int, int], float] = {}
+        self.adjacency: Dict[Tuple[int, int], Tuple[Tuple[int, int], ...]] = {}
+        self.build_ms = 0.0
 
     def _cell(self, x: float, y: float) -> Tuple[int, int]:
         return (int(math.floor(x / self.cell_size)), int(math.floor(y / self.cell_size)))
@@ -448,92 +458,160 @@ class CoarseNavGraph:
         max_y = min_y + (int(meta.get("ny", 0)) - 1) * float(meta.get("step", 1.0))
         return min_x <= x <= max_x and min_y <= y <= max_y
 
-    def _cell_clear(self, x: float, y: float, z: float, height: float, radius: float) -> bool:
-        if not self._in_bounds(x, y):
-            return False
-        wz = self.bot._terrain_height(x, y)
-        if wz is None:
-            return False
-        return not self.bot._blocked(x, y, wz, height, radius)
-
     def _center(self, ix: int, iy: int) -> Vec2:
         return ((ix + 0.5) * self.cell_size, (iy + 0.5) * self.cell_size)
 
-    def find_waypoint(self, now: float, start: Vec3, goal: Vec2, radius: float, height: float) -> Vec2:
-        if (now - self.last_replan_t < 0.5 and self.cached_waypoint is not None
+    def build_static_graph(self) -> bool:
+        """Precompute walkable 16 m cells and legal edges during hello startup.
+
+        The graph uses a conservative 4 m body radius (roughly 12 cubes). Local
+        steering still performs exact, live-radius collision checks each tick.
+        If a match produces a larger mech, callers bypass this graph rather than
+        trusting undersized precomputed clearances.
+        """
+        import time
+        t0 = time.perf_counter()
+        meta = getattr(self.bot, "terrain_meta", {}) or {}
+        if not getattr(self.bot, "terrain_values", None) or not meta:
+            self.graph_ready = False
+            return False
+        min_x = float(meta.get("minX", 0.0))
+        min_y = float(meta.get("minY", 0.0))
+        step = float(meta.get("step", 1.0))
+        max_x = min_x + (int(meta.get("nx", 0)) - 1) * step
+        max_y = min_y + (int(meta.get("ny", 0)) - 1) * step
+        cfg = getattr(self.bot, "cfg", {}) or {}
+        mech_cfg = cfg.get("mech", {}) or {}
+        self.graph_height = float(mech_cfg.get("height", 9.0))
+        self.graph_radius = max(4.0, float(mech_cfg.get("radius", 2.5)) + 1.5)
+        step_up = float(mech_cfg.get("step_up", 1.2))
+        max_slope = float(mech_cfg.get("max_slope_deg", 50.0))
+
+        ix0 = int(math.floor(min_x / self.cell_size))
+        ix1 = int(math.floor(max_x / self.cell_size))
+        iy0 = int(math.floor(min_y / self.cell_size))
+        iy1 = int(math.floor(max_y / self.cell_size))
+        walkable: set[Tuple[int, int]] = set()
+        heights: Dict[Tuple[int, int], float] = {}
+        for ix in range(ix0, ix1 + 1):
+            for iy in range(iy0, iy1 + 1):
+                cell = (ix, iy)
+                x, y = self._center(ix, iy)
+                z = self.bot._terrain_height(x, y)
+                if z is None:
+                    continue
+                heights[cell] = float(z)
+                if not self.bot._blocked(x, y, float(z), self.graph_height, self.graph_radius):
+                    walkable.add(cell)
+
+        adjacency: Dict[Tuple[int, int], Tuple[Tuple[int, int], ...]] = {}
+        diagonal_len = self.cell_size * math.sqrt(2.0)
+        for ix, iy in walkable:
+            src = (ix, iy)
+            sx, sy = self._center(ix, iy)
+            sz = heights[src]
+            legal: List[Tuple[int, int]] = []
+            for dx, dy in self.NEIGHBORS:
+                dst = (ix + dx, iy + dy)
+                if dst not in walkable:
+                    continue
+                if dx and dy and ((ix + dx, iy) not in walkable or (ix, iy + dy) not in walkable):
+                    continue
+                tx, ty = self._center(*dst)
+                length = diagonal_len if dx and dy else self.cell_size
+                if not self.bot._terrain_segment_clear(
+                    sx, sy, sz, (tx - sx) / length, (ty - sy) / length,
+                    length, step_up, max_slope
+                ):
+                    continue
+                legal.append(dst)
+            adjacency[src] = tuple(legal)
+
+        self.walkable = walkable
+        self.heights = heights
+        self.adjacency = adjacency
+        self.graph_ready = bool(walkable)
+        self.build_ms = (time.perf_counter() - t0) * 1000.0
+        return self.graph_ready
+
+    def _nearest_walkable(self, cell: Tuple[int, int], max_ring: int = 2) -> Optional[Tuple[int, int]]:
+        if cell in self.walkable:
+            return cell
+        best = None
+        best_d = float("inf")
+        cx, cy = cell
+        for ring in range(1, max_ring + 1):
+            for dx in range(-ring, ring + 1):
+                for dy in range(-ring, ring + 1):
+                    if max(abs(dx), abs(dy)) != ring:
+                        continue
+                    candidate = (cx + dx, cy + dy)
+                    if candidate in self.walkable:
+                        d = dx * dx + dy * dy
+                        if d < best_d:
+                            best, best_d = candidate, d
+            if best is not None:
+                return best
+        return None
+
+    def find_waypoint(self, now: float, start: Vec3, goal: Vec2,
+                      radius: float, height: float) -> Vec2:
+        if (now - self.last_replan_t < 0.35 and self.cached_waypoint is not None
                 and self.cached_goal is not None
                 and math.hypot(goal[0] - self.cached_goal[0], goal[1] - self.cached_goal[1]) < 24.0):
             return self.cached_waypoint
         self.last_replan_t = now
         if not self._in_bounds(goal[0], goal[1]):
             return goal
-        sc = self._cell(start[0], start[1])
-        gc = self._cell(goal[0], goal[1])
+
+        # The precomputed graph is deliberately bypassed for unusually large
+        # mechs: local steering remains collision-safe with their true radius.
+        if not self.graph_ready or radius > self.graph_radius + 1e-3 or abs(height - self.graph_height) > 2.0:
+            return goal
+
+        sc = self._nearest_walkable(self._cell(start[0], start[1]))
+        gc = self._nearest_walkable(self._cell(goal[0], goal[1]), max_ring=3)
+        if sc is None or gc is None:
+            return goal
         if sc == gc:
             self.cached_waypoint = goal
+            self.cached_goal = (float(goal[0]), float(goal[1]))
             return goal
 
         pq: List[Tuple[float, Tuple[int, int]]] = [(0.0, sc)]
         came: Dict[Tuple[int, int], Tuple[int, int]] = {}
         g_cost: Dict[Tuple[int, int], float] = {sc: 0.0}
-        best_node, best_h = sc, math.hypot(gc[0] - sc[0], gc[1] - sc[1])
+        best_node = sc
+        best_h = math.hypot(gc[0] - sc[0], gc[1] - sc[1])
         expands = 0
-
-        # Keep worst-case planning bounded; local steering remains active while
-        # this coarse fallback makes incremental progress.
-        while pq and expands < 180:
+        while pq and expands < 400:
             _, cur = heapq.heappop(pq)
             expands += 1
             if cur == gc:
                 best_node = cur
                 break
-            cx, cy = cur
-            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)):
-                nxt = (cx + dx, cy + dy)
-                wx, wy = self._center(nxt[0], nxt[1])
-                wz = self.bot._terrain_height(wx, wy)
-                if wz is None or not self._cell_clear(wx, wy, wz, height, radius):
-                    continue
-                # Do not cut diagonally through the corner of two blocked cells.
-                if dx != 0 and dy != 0:
-                    side_a = self._center(cx + dx, cy)
-                    side_b = self._center(cx, cy + dy)
-                    if (not self._cell_clear(side_a[0], side_a[1], start[2], height, radius)
-                            or not self._cell_clear(side_b[0], side_b[1], start[2], height, radius)):
-                        continue
-                cur_xy = self._center(cx, cy)
-                cur_z = self.bot._terrain_height(cur_xy[0], cur_xy[1])
-                if cur_z is None:
-                    cur_z = start[2]
-                edge_dx, edge_dy = wx - cur_xy[0], wy - cur_xy[1]
-                edge_len = math.hypot(edge_dx, edge_dy)
-                mech_cfg = getattr(self.bot, "cfg", {}).get("mech", {}) or {}
-                step_up = float(mech_cfg.get("step_up", 1.2))
-                max_slope = float(mech_cfg.get("max_slope_deg", 50.0))
-                if not self.bot._terrain_segment_clear(cur_xy[0], cur_xy[1], cur_z, edge_dx / max(edge_len, 1e-9), edge_dy / max(edge_len, 1e-9), edge_len, step_up, max_slope):
-                    continue
-                step_c = 1.414 if (dx != 0 and dy != 0) else 1.0
-                nc = g_cost[cur] + step_c
+            for nxt in self.adjacency.get(cur, ()):
+                dx, dy = nxt[0] - cur[0], nxt[1] - cur[1]
+                step_cost = math.sqrt(2.0) if dx and dy else 1.0
+                nc = g_cost[cur] + step_cost
                 if nc < g_cost.get(nxt, 1e9):
                     g_cost[nxt] = nc
                     came[nxt] = cur
                     h = math.hypot(gc[0] - nxt[0], gc[1] - nxt[1])
                     if h < best_h:
-                        best_h = h
-                        best_node = nxt
-                    heapq.heappush(pq, (nc + h * 1.15, nxt))
+                        best_h, best_node = h, nxt
+                    heapq.heappush(pq, (nc + h * 1.05, nxt))
 
         cur = best_node
-        path = []
+        path: List[Tuple[int, int]] = []
         while cur in came:
-            path.append(self._center(cur[0], cur[1]))
+            path.append(cur)
             cur = came[cur]
         path.reverse()
-        # The first reconstructed node is the immediate next waypoint; skipping
-        # it can make the steering controller cut across the first obstacle.
-        self.cached_waypoint = path[0] if path else goal
+        waypoint = self._center(*path[0]) if path else goal
+        self.cached_waypoint = waypoint
         self.cached_goal = (float(goal[0]), float(goal[1]))
-        return self.cached_waypoint
+        return waypoint
 
 
 class ContextSteerer:
@@ -544,6 +622,9 @@ class ContextSteerer:
         self.nav = nav
         self._stagnation_pos: Optional[Vec2] = None
         self._stagnation_t: float = 0.0
+        self._nav_waypoint: Optional[Vec2] = None
+        self._nav_goal: Optional[Vec2] = None
+        self._nav_waypoint_until: float = -1.0
 
     def evaluate(
         self,
@@ -566,16 +647,36 @@ class ContextSteerer:
         walk_speed = float(stats.get("walk_speed", 14.0))
         boost_speed = float(stats.get("boost_speed", 22.0))
 
-        # Stagnation detection for coarse A* fallback
+        # Persist an A* detour rather than forgetting it on the next tick.
+        # A route is invalidated when the strategic goal changes materially,
+        # the waypoint is reached, or its short hold expires.
         active_goal = goal
+        same_goal = (self._nav_goal is not None and
+                     math.hypot(goal[0] - self._nav_goal[0], goal[1] - self._nav_goal[1]) < 24.0)
+        waypoint_reached = (self._nav_waypoint is not None and
+                            math.hypot(mx - self._nav_waypoint[0], my - self._nav_waypoint[1]) < 7.0)
+        if not same_goal or waypoint_reached or now > self._nav_waypoint_until:
+            self._nav_waypoint = None
+            self._nav_goal = None
+        if self._nav_waypoint is not None:
+            active_goal = self._nav_waypoint
+
+        # Stagnation detection for bounded, precomputed coarse A* fallback.
+        stagnant = False
         if self._stagnation_pos is None:
             self._stagnation_pos = (mx, my)
             self._stagnation_t = now
         elif now - self._stagnation_t >= 0.8:
-            if math.hypot(mx - self._stagnation_pos[0], my - self._stagnation_pos[1]) < 2.0 and self.nav is not None:
-                active_goal = self.nav.find_waypoint(now, (mx, my, mz), goal, radius, height)
+            stagnant = math.hypot(mx - self._stagnation_pos[0], my - self._stagnation_pos[1]) < 2.0
             self._stagnation_pos = (mx, my)
             self._stagnation_t = now
+        if stagnant and self.nav is not None:
+            waypoint = self.nav.find_waypoint(now, (mx, my, mz), goal, radius, height)
+            if math.hypot(waypoint[0] - mx, waypoint[1] - my) >= 7.0:
+                self._nav_waypoint = waypoint
+                self._nav_goal = (float(goal[0]), float(goal[1]))
+                self._nav_waypoint_until = now + 1.5
+                active_goal = waypoint
 
         interest = [0.0] * NUM_DIRS
         danger = [0.0] * NUM_DIRS
@@ -589,10 +690,15 @@ class ContextSteerer:
                 val += max(0.0, dx * strafe_vec[0] + dy * strafe_vec[1]) * strafe_weight
             if px != 0.0 or py != 0.0:
                 val += max(0.0, dx * px + dy * py) * 0.18
-            # Modest vision-only concealment preference. Buildings remain the
-            # hard cover; tree crowns/trunks only reduce enemy vision, not shots.
-            tree_index = getattr(bot, "tree_index", None)
-            if tree_index is not None and threats:
+            interest[k] = val
+
+        # Expensive building/tree LOS queries are evaluated only for the three
+        # most goal-aligned candidate directions, not all 24 directions.
+        tree_index = getattr(bot, "tree_index", None)
+        if tree_index is not None and threats:
+            top_candidates = sorted(range(NUM_DIRS), key=lambda i: interest[i], reverse=True)[:3]
+            for k in top_candidates:
+                dx, dy = DIR_VECS[k]
                 qx, qy = mx + dx * 14.0, my + dy * 14.0
                 qz = bot._terrain_height(qx, qy)
                 if qz is None:
@@ -606,8 +712,7 @@ class ContextSteerer:
                     enemy_eye = (float(tp[0]), float(tp[1]), float(tp[2]) + 8.0)
                     if not bot._ray_blocked(enemy_eye, our_eye) and tree_index.vision_blocked_by_trees(enemy_eye, our_eye):
                         conceal_count += 1
-                val += min(0.30, conceal_count * 0.10)
-            interest[k] = val
+                interest[k] += min(0.30, conceal_count * 0.10)
 
         for k, (dx, dy) in enumerate(DIR_VECS):
             if not bot._terrain_segment_clear(mx, my, mz, dx, dy, 14.0, step_up, max_slope):
@@ -714,6 +819,8 @@ def choose_supply_drop_goal(
     opponent close to the capture ring. It only proposes a goal; cover and
     zone-emergency logic in Bot.act may still override it.
     """
+    if not me.get("in_zone", True):
+        return None
     pos = me.get("pos", (0.0, 0.0, 0.0))
     mx, my = float(pos[0]), float(pos[1])
     my_id = me.get("id")
@@ -752,12 +859,8 @@ def choose_supply_drop_goal(
         max_dist = 210.0 if lands_in <= 0.0 else 165.0
         if distance > max_dist:
             continue
-        # Do not chase a drop that cannot plausibly be reached before it lands
-        # plus the four-second capture period. A landed drop can be approached
-        # later because it remains in the world until collected.
-        if lands_in > 0.0 and effective_speed > 1.0:
-            if distance / effective_speed > lands_in + 4.0:
-                continue
+        # Supply drops persist after landing. Keep a stable goal during the
+        # final seconds instead of rejecting it one tick and accepting it next.
         # Drops are placed inside the future ring. Keep a margin to avoid routing
         # to the shrinking edge if the zone metadata is available.
         if next_radius < 1e8:
@@ -817,9 +920,16 @@ def choose_defensive_aim(
     return None
 
 
-def should_suppress_optional_fire(me: Dict[str, Any], has_visible_enemy: bool) -> bool:
-    """Avoid optional NPC/crate damage while recovering, never suppress self-defence."""
-    if has_visible_enemy:
+def should_suppress_optional_fire(
+    me: Dict[str, Any], has_visible_enemy: bool, time_since_damage: float = 999.0,
+) -> bool:
+    """Protect an imminent regen window, but don't block immediate cube rewards.
+
+    Recent near/mid sounds alone are not visible enemies and must not disable
+    this policy. When damage was taken very recently, an optional crate cube can
+    still be worth taking; suppress only after the regen timer has progressed.
+    """
+    if has_visible_enemy or time_since_damage < 2.0:
         return False
     hp = float(me.get("hp", 1400.0))
     max_hp = max(1.0, float(me.get("max_hp", 1400.0)))

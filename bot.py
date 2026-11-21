@@ -103,7 +103,7 @@ def solve_intercept(r: Vec3, v: Vec3, speed: float, max_t: float = 2.5) -> float
 
 
 class Bot:
-    name = "Oval-Ghost-v9.1-tactical"
+    name = "Oval-Ghost-v9.2-latency-safe"
 
     def __init__(self, hello: mf.Hello):
         self.hello = hello
@@ -191,6 +191,12 @@ class Bot:
             self.prisms = []
             self.prism_bins = {}
             self.terrain_values = None
+        # Static walkability/edge graph is built once during the 20 s hello
+        # startup allowance. Per-tick A* then visits only cached adjacency lists.
+        try:
+            self.nav_graph.build_static_graph()
+        except Exception:
+            self.nav_graph.graph_ready = False
 
     def _prisms_in_bbox(self, min_x: float, min_y: float,
                         max_x: float, max_y: float) -> List[Dict[str, Any]]:
@@ -516,8 +522,13 @@ class Bot:
             src, dst = path[0], path[-1]
             if len(src) < 2 or len(dst) < 2:
                 continue
-            beam_dist = point_segment_distance(
-                float(mx), float(my), float(src[0]), float(src[1]), float(dst[0]), float(dst[1])
+            # Lightning paths may contain several chain segments. Measure the
+            # polyline, not the misleading chord from its first to last point.
+            beam_dist = min(
+                point_segment_distance(float(mx), float(my),
+                                       float(path[i][0]), float(path[i][1]),
+                                       float(path[i + 1][0]), float(path[i + 1][1]))
+                for i in range(len(path) - 1)
             )
             if beam_dist > 35.0:
                 continue
@@ -781,6 +792,48 @@ class Bot:
         if urgent:
             return unit(threat_x, threat_y), True, jump
         return (0.0, 0.0), False, False
+
+    def _incoming_mortar_jump(self, obs: mf.Observation, me: Dict[str, Any]) -> bool:
+        """Cheap jump-only check; ContextSteerer already handles full projectile CPA."""
+        if not me.get("grounded", False):
+            return False
+        px, py, pz = (float(v) for v in me["pos"])
+        mv = me.get("vel", (0.0, 0.0, 0.0))
+        vx, vy, vz = (float(mv[i]) if i < len(mv) else 0.0 for i in range(3))
+        stats = me.get("stats", {}) or {}
+        height = float(stats.get("height", self.cfg.get("mech", {}).get("height", 9.0)))
+        radius = float(stats.get("radius", self.cfg.get("mech", {}).get("radius", 2.5)))
+        center_offset = height * 0.5
+        mortar_cfg = self.cfg.get("weapons", {}).get("mortar", {}) or {}
+        gravity = float(mortar_cfg.get("gravity", 22.0))
+        splash = float(mortar_cfg.get("splash_radius", 7.0))
+        danger_r = max(7.0, splash + radius + 0.5)
+        for proj in obs.get("projectiles", []) or []:
+            if proj.get("kind") != "mortar":
+                continue
+            pos = proj.get("pos", (0.0, 0.0, 0.0))
+            vel = proj.get("vel", (0.0, 0.0, 0.0))
+            for step in range(1, 12):
+                dt = step * 0.05
+                if dt > 0.55:
+                    break
+                sx = float(pos[0]) + float(vel[0]) * dt
+                sy = float(pos[1]) + float(vel[1]) * dt
+                sz = float(pos[2]) + float(vel[2]) * dt - 0.5 * gravity * dt * dt
+                ground = self._terrain_height(sx, sy)
+                if ground is not None and sz <= ground:
+                    sz = ground
+                    impact = True
+                else:
+                    impact = False
+                mx = px + vx * dt
+                my = py + vy * dt
+                mz = pz + vz * dt + center_offset
+                if math.sqrt((mx - sx) ** 2 + (my - sy) ** 2 + (mz - sz) ** 2) <= danger_r:
+                    return True
+                if impact:
+                    break
+        return False
 
     def _target_aim(self, me: Dict[str, Any], target: Dict[str, Any], weapon: Dict[str, Any], kind: str) -> Tuple[float, float, float]:
         mx, my, mz = me["pos"]
@@ -1052,7 +1105,8 @@ class Bot:
         # Optional farming is deferred while damaged and recovering. This gate
         # never applies to a visible hostile mech, so self-defence is preserved.
         suppress_optional_fire = should_suppress_optional_fire(
-            me, has_visible_enemy=bool(enemies) or recent_alert
+            me, has_visible_enemy=bool(enemies),
+            time_since_damage=t - self.last_damage_t,
         )
 
         # Opportunistic drone farming: two cubes are valuable, but do not detour
@@ -1072,7 +1126,7 @@ class Bot:
         # Pre-rotate toward a safe, upcoming supply drop. Existing cover and
         # zone-emergency decisions below retain priority over this opportunity.
         drop_choice = None
-        if nearest_enemy_dist > 65.0 and not recent_alert:
+        if me.get("in_zone", True) and nearest_enemy_dist > 65.0 and not recent_alert:
             drop_choice = choose_supply_drop_goal(obs, me, prioritized_threats)
         if drop_choice is not None:
             goal, movement_goal_weight = drop_choice
@@ -1255,7 +1309,7 @@ class Bot:
 
         # V9 movement: 24-direction interest/danger steering with map geometry,
         # projectile VO and a limited cover/retreat preference. Keep V8 combat.
-        _, _, jump = self._incoming_threat(obs, me)  # retain V8's jump response
+        jump = self._incoming_mortar_jump(obs, me)  # steering handles full CPA; this only gates jump
         strafe_vec: Optional[Vec2] = None
         strafe_weight = 0.0
         if nearby:

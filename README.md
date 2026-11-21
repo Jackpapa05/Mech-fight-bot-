@@ -1,35 +1,38 @@
-# Oval Ghost V9.1 — V8 combat + V9 tactical movement and drop logic
+# Oval Ghost V9.2 — latency-safe tactical integration
 
-V9.1 is an **unscored candidate** based on the V8 agent (reported practice score 2.92). It preserves V8 combat/aiming/weapon logic and the integrated V9 context-steering subsystem, then adds cautious supply-drop pre-rotation and recovery-aware optional-fire suppression from Gemini's latest proposal.
+V9.2 is a guarded improvement over the V9.1 candidate. It addresses the latency and policy issues identified in the independent review while preserving V9.1's combat, aiming, weapon selection and 24-direction movement policy.
 
-## Included
+## Changes in V9.2
 
-- `bot.py` — V8 combat policy with V9 movement/threat tracking, third-party beam filtering, safe pre-rotation and defensive aim fallback.
-- `v9_core.py` — tree vision index, multimodal threat tracker, unilateral projectile avoidance, 24-direction context steering, bounded coarse A*, rooftop reachability helper, supply-drop selection and tactical helper functions.
-- `mechfight.py` — competition protocol wrapper.
-- `Dockerfile` — standard-library Python runtime.
-- `test_v9_integrated.py` — tests using the real V8 map/geometry methods.
-- `test_v9_reference.py` — Gemini's supplementary reference tests.
-- `test_v9_tactical.py` — tests for supply-drop, defensive-aim and optional-fire helper logic.
+- **Precomputed navigation graph:** builds a 16 m static traversability graph during the `hello` startup budget. Runtime A* traverses cached adjacency lists rather than repeatedly doing polygon and terrain checks.
+- **Persistent detour waypoint:** a stagnation-triggered A* waypoint is held for up to 1.5 seconds (or until reached / the strategic goal changes), instead of being forgotten on the next observation.
+- **Reduced tree-LOS work:** tree concealment is evaluated only for the three most goal-aligned movement directions, rather than all 24 directions.
+- **Drop policy stability:** supply-drop goals are ignored while outside the current zone; the ETA cutoff that caused a one-second landed-drop goal flip has been removed because drops persist after landing.
+- **Recovery-aware optional firing:** sounds alone no longer count as a visible mech for the suppression helper. Optional fire is suppressed only after the damage timer has progressed for at least 2 seconds; visible-mech self-defence is never suppressed.
+- **Jump-only mortar check:** the bot no longer reruns full projectile CPA solely to obtain the jump flag; ContextSteerer handles movement danger, while a small mortar-only routine handles jump timing.
+- **Lightning beam polyline distance:** threat bearing checks use every consecutive beam segment, not only the chord from first to last point.
 
-## Important strategy safeguards
+## Notes on the independent audit
 
-- A supply drop is only selected if it is not held by another mech, is within the next safe circle, has no very-close tracked threat and is plausibly reachable. Existing cover/emergency-zone decisions can override the drop goal.
-- Optional NPC/crate fire is suppressed below 85% HP when there is no visible mech or recent near/mid threat. Visible-mech self-defence is never suppressed by this helper.
-- Defensive aim uses recent threat evidence and avoids rotating toward stale five-second memories.
-- Rooftop reachability is currently an advisory helper; this bot does **not** have a complete roof-route/jump/jet planner.
+The audit's report of an unfiltered `_remember_beams` path was not reproduced in this V9.1 source: the function already rejected beams whose segment was more than 35 m from the mech before updating `last_attacker_id` / `last_threat_bearing`. V9.2 retains that filter and improves polyline handling for lightning.
 
-## Local validation
+## Validation performed
 
-```bash
-python3 /path/to/mechfight-kit/check/check.py --map-dir /path/to/arena -- python3 -u bot.py
-MECHFIGHT_ARENA=/path/to/arena python3 -m unittest test_v9_integrated.py -v
-MECHFIGHT_ARENA=/path/to/arena python3 -m unittest test_v9_reference.py -v
-python3 -m unittest test_v9_tactical.py -v
-```
+- Official `check/check.py`: PASS, 300/300 observations, 0 late, 0 wrong tick, 0 bad lines.
+- Official checker timing on this machine: p50 1.2 ms, p90 1.8 ms, p99 2.6 ms, max 3.2 ms.
+- Unit/integration suites: 23 tests PASS against the extracted arena.
+- Real map graph: 2,120 walkable 16 m cells and 12,920 directed edges; graph precomputation about 0.40–0.46 s during startup.
+- A* query on the cached graph: max about 1.4 ms in the tested long-route case.
+- Full `Bot.act()` stress test with 15 mechs, 40 projectiles, beam/sound inputs and repeated stagnation: p50 5.99 ms, p90 6.48 ms, p99 10.06 ms, max 11.96 ms (local machine).
 
-The official checker validates protocol and timing, not gameplay placement. Docker sandbox parity has not been independently verified in this environment.
+These tests verify protocol, latency and selected code paths. They do **not** establish that V9.2 scores better in the 48-match practice runner. Docker sandbox parity has not been independently verified here.
 
-## Promotion rule
+## Files
 
-The current reported best is V8 at **2.92**. Do not replace it unless this candidate's actual 48-match practice score is strictly greater than 2.92.
+- `bot.py`, `v9_core.py`, `mechfight.py`
+- `test_v9_integrated.py`, `test_v9_reference.py`, `test_v9_tactical.py`, `test_v9_2.py`
+- `AUDIT_NOTES.md`, `VALIDATION.md`
+
+## Promotion policy
+
+V8's reported 2.92 remains the best verified practice score unless a newer candidate earns a higher actual score. Do not overwrite or discard the higher-scoring commit.

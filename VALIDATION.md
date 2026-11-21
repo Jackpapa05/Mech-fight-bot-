@@ -1,58 +1,49 @@
-# Oval Ghost V9.1 — Validation record
+# V9.2 validation log
 
-## Candidate status
-
-V9.1 is unscored. Current reported best remains V8 at 2.92.
-
-## Official conformance check
+## Official checker
 
 Command:
 
 ```bash
-python3 /path/to/mechfight-kit/check/check.py --map-dir /mnt/data/arena_local/arena -- python3 -u bot.py
+python3 /path/to/mechfight-kit/check/check.py --map-dir /path/to/arena -- python3 -u bot.py
 ```
 
-Latest local result:
+Result on the available local runtime:
 
+- 300 observations processed
+- 300 answers in time
+- 0 late answers
+- 0 stale/incorrect ticks
+- 0 bad lines
+- 0 debug drawing cap violations
+- p50 1.2 ms; p90 1.8 ms; p99 2.6 ms; max 3.2 ms
 - PASS
-- 300/300 observations answered
-- 0 missed 50 ms deadlines
-- 0 wrong ticks
-- 0 bad protocol lines
-- 0 over-cap debug drawings
-- p50 1.7 ms, p90 2.3 ms, p99 3.0 ms, max 43.8 ms (single local machine; not the 1-CPU Docker sandbox)
 
-## Real-map integrated tests
+## Unit / integration tests
 
 ```bash
-MECHFIGHT_ARENA=/mnt/data/arena_local/arena python3 -m unittest test_v9_integrated.py -v
+MECHFIGHT_ARENA=/path/to/arena python3 -m unittest \
+  test_v9_integrated.py test_v9_reference.py test_v9_tactical.py test_v9_2.py -v
 ```
 
-- 8/8 passed
-- Uses actual V8 bot geometry, 259 prisms, 1,560 trees and 774,680 terrain samples
-- Integrated steering stress: p50 5.286 ms, max 12.860 ms in this run
+Result: **23 tests passed**.
 
-## Gemini reference tests
+## Real-map navigation measurements
 
-```bash
-MECHFIGHT_ARENA=/mnt/data/arena_local/arena python3 -m unittest test_v9_reference.py -v
-```
+- Static graph build: approximately 0.40–0.46 s.
+- Walkable cells: 2,120.
+- Directed edges: 12,920.
+- Long-route cached-graph A* max: approximately 1.4 ms.
 
-- 4/4 passed
-- Its mock bot stubs collision, terrain-clearance and ray-blocking methods; these are supplementary algorithm tests, not proof of real navigation geometry.
+## Full action stress test
 
-## Added tactical helper tests
+Synthetic observation: 15 mechs, 40 projectiles, beams, sounds, repeated stationary/stagnation condition. 100 `Bot.act()` calls:
 
-```bash
-python3 -m unittest test_v9_tactical.py -v
-```
+- p50: 5.99 ms
+- p90: 6.48 ms
+- p99: 10.06 ms
+- max: 11.96 ms
 
-- 5/5 passed
-- Covers safe supply-drop selection, contested/held drop rejection, next-zone check, optional-fire suppression, and stale defensive-bearing rejection.
+## Important limits
 
-## Limitations
-
-- No Docker binary was available; exact 1 CPU / 512 MB / read-only container run is not reproduced.
-- No scored 48-match result exists yet.
-- Rooftop reachability remains advisory, not a full jet-assisted navigation planner.
-- The official checker does not simulate action consequences.
+These are local measurements, not a Docker sandbox guarantee. No gameplay score has been measured. The official conformance checker does not simulate the results of actions.
