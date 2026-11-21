@@ -100,7 +100,7 @@ def solve_intercept(r: Vec3, v: Vec3, speed: float, max_t: float = 2.5) -> float
 
 
 class Bot:
-    name = "Oval-Ghost-v6-correctness"
+    name = "Oval-Ghost-v7-p0-fixes"
 
     def __init__(self, hello: mf.Hello):
         self.hello = hello
@@ -149,10 +149,15 @@ class Bot:
             # prisms rather than all 259 structures.
             for idx, prism in enumerate(self.prisms):
                 x0, y0, x1, y1 = prism["bbox"]
-                ix0 = math.floor((x0 - 3.0) / self.bin_size)
-                ix1 = math.floor((x1 + 3.0) / self.bin_size)
-                iy0 = math.floor((y0 - 3.0) / self.bin_size)
-                iy1 = math.floor((y1 + 3.0) / self.bin_size)
+                # Cubes enlarge the mech without a hard size cap. The match's
+                # finite cube sources make a 16 m index margin conservative for
+                # any realistic match loadout (and avoids missing an edge prism
+                # when the mech's grown radius crosses a 32 m bin boundary).
+                index_pad = 16.0
+                ix0 = math.floor((x0 - index_pad) / self.bin_size)
+                ix1 = math.floor((x1 + index_pad) / self.bin_size)
+                iy0 = math.floor((y0 - index_pad) / self.bin_size)
+                iy1 = math.floor((y1 + index_pad) / self.bin_size)
                 for ix in range(ix0, ix1 + 1):
                     for iy in range(iy0, iy1 + 1):
                         self.prism_bins.setdefault((ix, iy), []).append(idx)
@@ -409,7 +414,10 @@ class Bot:
                 dd = dist2(q, tp)
                 closest = min(closest, dd)
                 start = (float(tp[0]), float(tp[1]), float(tp[2]) + 6.0)
-                end = (q[0], q[1], float(z) + 4.5)
+                candidate_floor = self._terrain_height(q[0], q[1])
+                if candidate_floor is None:
+                    candidate_floor = float(z)
+                end = (q[0], q[1], float(candidate_floor) + 4.5)
                 if self._ray_blocked(start, end):
                     protected += 1
             if protected == 0:
@@ -729,36 +737,99 @@ class Bot:
         pitch = math.atan2(target_center_z - muzzle_z, horizontal)
         return yaw, pitch, horizontal
 
+    def _laser_safe_abort_aim(self, me: Dict[str, Any], preferred_yaw: float,
+                              weapon: Dict[str, Any]) -> Tuple[float, float]:
+        """Find an upward, prism-clear direction for releasing a stale laser charge."""
+        x, y, z = me["pos"]
+        muzzle_z = z + float(me.get("stats", {}).get("muzzle_height", 7.0))
+        actual = me.get("aim", [preferred_yaw, 0.0])
+        actual_yaw = float(actual[0])
+        max_pitch = float(self.cfg.get("mech", {}).get("max_pitch", 1.3))
+        pitch = min(max_pitch, 1.15)
+        ray_len = float(weapon.get("stats", {}).get("range", 280.0))
+        # Try away from the target first, then lateral directions. The ray is
+        # deliberately checked for the full hitscan range, not just nearby cover.
+        candidates = [
+            wrap(preferred_yaw + math.pi),
+            wrap(actual_yaw + math.pi / 2.0),
+            wrap(actual_yaw - math.pi / 2.0),
+            wrap(preferred_yaw + math.pi / 2.0),
+            wrap(preferred_yaw - math.pi / 2.0),
+            wrap(actual_yaw),
+        ]
+        cp = math.cos(pitch)
+        sp = math.sin(pitch)
+        start = (float(x), float(y), float(muzzle_z))
+        for yaw in candidates:
+            end = (float(x) + ray_len * cp * math.cos(yaw),
+                   float(y) + ray_len * cp * math.sin(yaw),
+                   float(muzzle_z) + ray_len * sp)
+            if not self._ray_blocked(start, end):
+                return yaw, pitch
+        # Last resort: steepest permitted upward angle. It is still preferable
+        # to retaining a charge while walking at half speed into the wall.
+        return actual_yaw, max_pitch
+
     def _mortar_aim(self, me: Dict[str, Any], target: Dict[str, Any], weapon: Dict[str, Any]) -> Tuple[float, float, float]:
+        """Solve a low-arc ballistic intercept with a converged target lead.
+
+        Mortar range can require more than 2.5 s of flight time. The shell TTL
+        comes from the live config; use it as the physical upper bound instead
+        of silently truncating long shots.
+        """
         mx, my, mz = me["pos"]
         tx, ty, tz = target["pos"]
         tv = target.get("vel", [0.0, 0.0, 0.0])
         muzzle_z = mz + float(me.get("stats", {}).get("muzzle_height", 7.0)) + 2.5
         cubes = float(target.get("cubes", 0.0))
         target_z0 = tz + (1.75 if target.get("kind") == "npc" else 4.5 * (1.0 + 0.05 * cubes))
-        v = float(weapon.get("stats", {}).get("speed", 72.0))
-        g = float(self.cfg.get("weapons", {}).get("mortar", {}).get("gravity", 22.0))
-        # Iterate target lead and flight time twice. Mortar shells are ballistic,
-        # so a fixed 0.8 s lead is inaccurate at both short and long ranges.
-        aim_x, aim_y = float(tx), float(ty)
+        mortar_cfg = self.cfg.get("weapons", {}).get("mortar", {})
+        v = float(weapon.get("stats", {}).get("speed", mortar_cfg.get("speed", 72.0)))
+        g = float(mortar_cfg.get("gravity", 22.0))
+        ttl = float(mortar_cfg.get("ttl", 7.0))
+        max_flight = max(0.5, min(6.5, ttl - 0.1))
+        flight_t = min(max_flight, math.hypot(float(tx) - mx, float(ty) - my) / max(1.0, v * math.cos(math.radians(42.0))))
         pitch = math.radians(42.0)
-        R = max(0.1, math.hypot(aim_x - mx, aim_y - my))
-        flight_t = min(2.5, R / max(1.0, v * math.cos(pitch)))
-        for _ in range(2):
-            R = max(0.1, math.hypot(aim_x - mx, aim_y - my))
-            h = target_z0 + float(tv[2]) * flight_t - muzzle_z
-            disc = v ** 4 - g * (g * R * R + 2.0 * h * v * v)
-            if disc > 0.0:
-                tan_theta = (v * v - math.sqrt(disc)) / max(1e-6, g * R)
-                pitch = math.atan(tan_theta)
-            else:
-                pitch = math.radians(42.0)
-            flight_t = min(2.5, R / max(1.0, v * math.cos(pitch)))
+        aim_x, aim_y = float(tx), float(ty)
+
+        # Fixed-point iteration: predicted target location determines range and
+        # pitch; pitch determines flight time; repeat until those agree.
+        for _ in range(10):
             aim_x = float(tx) + float(tv[0]) * flight_t
             aim_y = float(ty) + float(tv[1]) * flight_t
+            target_z = target_z0 + float(tv[2]) * flight_t
+            horizontal = max(0.1, math.hypot(aim_x - mx, aim_y - my))
+            height_delta = target_z - muzzle_z
+            disc = v ** 4 - g * (g * horizontal * horizontal + 2.0 * height_delta * v * v)
+            if disc >= 0.0:
+                tan_theta = (v * v - math.sqrt(max(0.0, disc))) / max(1e-6, g * horizontal)
+                pitch = math.atan(tan_theta)
+            else:
+                # No low-arc solution at this range/height; keep a conservative
+                # 42-degree lob and let the path/score checks decide whether use.
+                pitch = math.radians(42.0)
+            cos_pitch = max(0.15, math.cos(pitch))
+            next_t = min(max_flight, horizontal / max(1.0, v * cos_pitch))
+            if abs(next_t - flight_t) < 0.002:
+                flight_t = next_t
+                break
+            flight_t = next_t
+
+        # Recompute once at the final lead so returned pitch and yaw correspond
+        # to the same predicted target position (no stale final pitch).
+        aim_x = float(tx) + float(tv[0]) * flight_t
+        aim_y = float(ty) + float(tv[1]) * flight_t
+        target_z = target_z0 + float(tv[2]) * flight_t
+        horizontal = max(0.1, math.hypot(aim_x - mx, aim_y - my))
+        height_delta = target_z - muzzle_z
+        disc = v ** 4 - g * (g * horizontal * horizontal + 2.0 * height_delta * v * v)
+        if disc >= 0.0:
+            tan_theta = (v * v - math.sqrt(max(0.0, disc))) / max(1e-6, g * horizontal)
+            pitch = math.atan(tan_theta)
+        else:
+            pitch = math.radians(42.0)
         yaw = math.atan2(aim_y - my, aim_x - mx)
-        R = max(0.1, math.hypot(aim_x - mx, aim_y - my))
-        return yaw, clamp(pitch, -0.2, 1.15), R
+        return yaw, clamp(pitch, -0.2, 1.15), horizontal
 
     def _mortar_path_clear(self, me: Dict[str, Any], yaw: float,
                            pitch: float, horizontal_range: float,
@@ -767,13 +838,16 @@ class Bot:
         speed = float(weapon.get("stats", {}).get("speed", 72.0))
         gravity = float(self.cfg.get("weapons", {}).get("mortar", {}).get("gravity", 22.0))
         cos_pitch = max(0.15, math.cos(pitch))
-        flight_t = clamp(horizontal_range / max(1.0, speed * cos_pitch), 0.05, 3.0)
+        ttl = float(self.cfg.get("weapons", {}).get("mortar", {}).get("ttl", 7.0))
+        flight_t = clamp(horizontal_range / max(1.0, speed * cos_pitch), 0.05, min(6.5, ttl - 0.1))
         x, y, z = me["pos"]
         muzzle_z = float(me.get("stats", {}).get("muzzle_height", 7.0)) + 2.5
         # Ignore the final 15% so the intended target/building splash does not
         # incorrectly count as an obstruction.
         end_t = flight_t * 0.85
-        steps = 10
+        # Keep path samples dense enough to catch a building crossed by a long
+        # shell arc; 8 m spacing is a practical accuracy/runtime compromise.
+        steps = max(10, min(40, int(math.ceil(speed * end_t / 8.0))))
         prev = (float(x), float(y), float(z) + muzzle_z)
         for i in range(1, steps + 1):
             tt = end_t * i / steps
@@ -961,28 +1035,48 @@ class Bot:
                         and self._mortar_path_clear(me, aim_yaw, aim_pitch, hrange, w1)):
                     fire[1] = True
             elif second_kind == "laser" and d > 38.0 and not any("lightning" in (e.get("weapons") or []) for e in nearby if dist3(e["pos"], me["pos"]) < 65.0):
-                aim_yaw, aim_pitch, hrange = self._target_aim(me, current_target, w1, "laser")
+                target_aim_yaw, target_aim_pitch, hrange = self._target_aim(me, current_target, w1, "laser")
                 charge = float(w1.get("charge", 0.0))
                 cooldown = float(w1.get("cooldown", 0.0))
-                actual_aim = me.get("aim", [aim_yaw, aim_pitch])
-                laser_aligned = (abs(wrap(aim_yaw - float(actual_aim[0]))) < 0.075
-                                 and abs(aim_pitch - float(actual_aim[1])) < 0.075)
+                actual_aim = me.get("aim", [target_aim_yaw, target_aim_pitch])
+                muzzle_z = z + float(me.get("stats", {}).get("muzzle_height", 7.0))
+                target_z = float(current_target["pos"][2]) + (1.75 if current_target.get("kind") == "npc" else 4.5 * (1.0 + 0.05 * float(current_target.get("cubes", 0.0))))
+                laser_los = not self._ray_blocked(
+                    (x, y, muzzle_z),
+                    (float(current_target["pos"][0]), float(current_target["pos"][1]), target_z))
                 if cooldown <= 0.02:
-                    # Pre-aim before starting a charge. Once charging, keep the
-                    # trigger held until the torso is actually on target; release
-                    # only when both charge and aim are ready.
                     max_charge = float(w1.get("stats", {}).get("charge", 0.75))
                     desired_charge = min(max_charge - 0.04, max(0.15, max_charge * 0.84))
-                    if charge <= 0.01:
-                        # Do not begin charging while the torso is still slewing.
-                        fire[1] = bool(laser_aligned)
-                    elif charge < desired_charge or not laser_aligned:
-                        fire[1] = True
+                    if laser_los:
+                        aim_yaw, aim_pitch = target_aim_yaw, target_aim_pitch
+                        laser_aligned = (abs(wrap(target_aim_yaw - float(actual_aim[0]))) < 0.075
+                                         and abs(target_aim_pitch - float(actual_aim[1])) < 0.075)
+                        if charge <= 0.01:
+                            # Never start a charge against a target hidden by a solid.
+                            fire[1] = bool(laser_aligned)
+                        elif charge < desired_charge or not laser_aligned:
+                            fire[1] = True
+                        else:
+                            fire[1] = False
+                    elif charge > 0.01:
+                        # A remembered enemy can remain in obs for 5 s after it
+                        # ducks behind a building. Do not keep charging at the wall.
+                        # Turn to a verified clear upward ray, then release the
+                        # charged shot in that harmless direction.
+                        safe_yaw, safe_pitch = self._laser_safe_abort_aim(me, target_aim_yaw, w1)
+                        aim_yaw, aim_pitch = safe_yaw, safe_pitch
+                        safe_aligned = (abs(wrap(safe_yaw - float(actual_aim[0]))) < 0.09
+                                        and abs(safe_pitch - float(actual_aim[1])) < 0.09)
+                        fire[1] = not safe_aligned
                     else:
+                        # No line of sight and no charge in progress: do not start.
+                        aim_yaw, aim_pitch = target_aim_yaw, target_aim_pitch
                         fire[1] = False
-                # Gun and laser share aim; a gun shot is also useful while the
-                # laser charges, but only when the actual torso is on the gun lead.
-                if w0 and d < float(w0.get("stats", {}).get("range", 230.0)):
+                else:
+                    aim_yaw, aim_pitch = target_aim_yaw, target_aim_pitch
+                # Gun shares the torso aim and cannot pass through a building.
+                # Avoid wasting ammunition at a remembered but occluded target.
+                if laser_los and w0 and d < float(w0.get("stats", {}).get("range", 230.0)):
                     gy, gp, _ = self._target_aim(me, current_target, w0, "gun")
                     if (abs(wrap(gy - float(actual_aim[0]))) < 0.12
                             and abs(gp - float(actual_aim[1])) < 0.12):
@@ -1017,13 +1111,6 @@ class Bot:
                     if hrange <= float(w0.get("stats", {}).get("range", 230.0)) and yaw_err < 0.18 and pitch_err < 0.18:
                         if float(w0.get("ammo", 0.0)) > 0 and float(w0.get("reload", 0.0)) <= 0.0:
                             fire[0] = True
-                # If the secondary can contribute at short range and is not a
-                # laser/mortar, use it when aligned.
-                if w1 and w1.get("kind") == "lightning" and d <= 45.0:
-                    ly, lp, _ = self._target_aim(me, current_target, w1, "lightning")
-                    if abs(wrap(ly - float(me.get("aim", [ly, 0.0])[0]))) < math.radians(23) and float(w1.get("cooldown", 0.0)) <= 0.02 and energy >= 3.0:
-                        aim_yaw, aim_pitch = ly, lp
-                        fire[1] = True
         elif utility_target is not None and w0:
             # Crate center is roughly 1.2 m above its base; it is stationary.
             p = utility_target.get("pos", [x, y, z])
@@ -1094,6 +1181,26 @@ class Bot:
                         and ev.get("bearing") is not None):
                     aim_yaw, aim_pitch = float(ev["bearing"]), 0.0
                     break
+
+        # Also handle an in-progress laser charge if the remembered target has
+        # just disappeared or the normal laser branch was bypassed (e.g. close
+        # range). Never let a charged beam release into a known solid.
+        if w1 and w1.get("kind") == "laser" and float(w1.get("charge", 0.0)) > 0.01:
+            charge_target_clear = False
+            if current_target is not None:
+                target_pos = current_target.get("pos", [x, y, z])
+                target_z = float(target_pos[2]) + (1.75 if current_target.get("kind") == "npc" else 4.5 * (1.0 + 0.05 * float(current_target.get("cubes", 0.0))))
+                muzzle_z = z + float(me.get("stats", {}).get("muzzle_height", 7.0))
+                charge_target_clear = not self._ray_blocked(
+                    (x, y, muzzle_z),
+                    (float(target_pos[0]), float(target_pos[1]), target_z))
+            if not charge_target_clear:
+                safe_yaw, safe_pitch = self._laser_safe_abort_aim(me, aim_yaw, w1)
+                aim_yaw, aim_pitch = safe_yaw, safe_pitch
+                actual_aim = me.get("aim", [safe_yaw, safe_pitch])
+                safely_aligned = (abs(wrap(safe_yaw - float(actual_aim[0]))) < 0.09
+                                  and abs(safe_pitch - float(actual_aim[1])) < 0.09)
+                fire[1] = not safely_aligned
 
         action.update({
             "move": [float(move[0]), float(move[1])],
