@@ -1,36 +1,32 @@
-# Oval Survivor — Mech Royale bot
+# Oval Sentinel V2 — Mech Royale bot
 
-A survival-first Python bot for `mechfight/1`. Standard-library only; uses the provided `mechfight.py` wrapper.
+A standard-library-only Python agent for `mechfight/1`.
 
-## Build and conformance check
-
-From this directory:
+## Build and check
 
 ```sh
 python3 -u bot.py
+python3 /path/to/mechfight-kit/check/check.py --map-dir /arena -- python3 -u bot.py
 ```
 
-The command above expects a protocol stream on stdin. Run the kit conformance check from the extracted kit directory:
+For the competition Docker sandbox, mount the kit's `arena/` folder at `/arena`:
 
 ```sh
-python3 check/check.py -- python3 -u ../mechfight-bot/bot.py
+docker build -t oval-sentinel .
+docker run --rm -i --network none --cpus 1 --memory 512m --read-only \
+  --tmpfs /tmp:rw,size=64m --user 65534:65534 \
+  -v "$PWD/arena:/arena:ro" oval-sentinel
 ```
 
-For Docker submission, this folder is already arranged with `Dockerfile` at the top level. Build it with:
+## Strategy
 
-```sh
-docker build -t oval-survivor .
-```
+- Quiet movement when there is no immediate danger (keeps ground speed below the step-sound threshold).
+- Zone prediction and urgent zone escape.
+- Static map loading, terrain sampling, obstacle-aware A* ground navigation.
+- Local cover search that evaluates line-of-sight blocking against visible threats.
+- Projectile prediction and emergency dodge/jump.
+- Conservative engagement logic, with disengagement/healing windows.
+- Selective NPC/crate farming, cube and drop prioritisation, and weapon pickups.
+- Predictive gun lead, weapon-specific laser/mortar/lightning choices, and adaptive upgrades.
 
-The bot uses observation/config values at runtime and loads `/arena/v2/world.json` when available. It falls back to zone navigation if the map file is unavailable.
-
-## Current strategy
-
-- Zone-aware movement with local static-prism avoidance.
-- Health-aware disengagement and lateral movement around nearby threats.
-- Incoming projectile checks with emergency dodging and mortar-jump response.
-- Predictive gun leading; weapon-specific laser, mortar and lightning behaviour.
-- Opportunistic cubes, weapon pickups, crates and uncontested supply drops.
-- Defensive and mobility-focused upgrade choices.
-
-This is a first strategic candidate, not a guaranteed winning bot. `check.py` validates protocol/timing, not game performance. Submit it to obtain the 48-match practice score, then tune based on actual placements.
+`check.py` validates protocol compliance and decision latency, not match outcomes. The 48-match practice score is the only evidence that a strategy change improves gameplay. Keep the last best-scoring commit as a fallback.
