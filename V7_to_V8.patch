@@ -1,0 +1,137 @@
+--- a/bot.py
++++ b/bot.py
+@@ -100,7 +100,7 @@
+ 
+ 
+ class Bot:
+-    name = "Oval-Ghost-v7-p0-fixes"
++    name = "Oval-Ghost-v8-cpa-beam"
+ 
+     def __init__(self, hello: mf.Hello):
+         self.hello = hello
+@@ -471,11 +471,12 @@
+         for sound in obs.get("sounds", []) or []:
+             kind = str(sound.get("kind", ""))
+             age = float(sound.get("age", 99.0))
+-            if kind in danger and age <= 1.2:
++            heard_t = t - age
++            if kind in danger and age <= 1.2 and heard_t + 1e-6 >= self.last_threat_t:
+                 self.last_threat_bearing = float(sound.get("bearing", 0.0))
+                 self.last_threat_kind = kind
+                 self.last_threat_dist = str(sound.get("dist", "far"))
+-                self.last_threat_t = t - age
++                self.last_threat_t = heard_t
+         if self.last_threat_bearing is None or t - self.last_threat_t > 2.0:
+             return None
+         d = {"near": 42.0, "mid": 112.0, "far": 225.0}.get(self.last_threat_dist, 150.0)
+@@ -486,6 +487,46 @@
+                 "vel": [0.0, 0.0, 0.0], "sound_kind": self.last_threat_kind}
+ 
+ 
++    def _remember_beams(self, obs: mf.Observation, me: Dict[str, Any], now: float) -> None:
++        """Use visible laser/lightning beams to remember the firing direction.
++
++        Beam paths begin at the shooter's muzzle and include the shooter ID.
++        This complements damage events: a beam can be visible even when it
++        misses, giving us an early direction to face if no mech is currently
++        visible. Trees do not block shots, so this is independent of tree cover.
++        """
++        mx, my, _ = me.get("pos", [0.0, 0.0, 0.0])
++        candidates = []
++        for beam in obs.get("beams", []) or []:
++            kind = str(beam.get("kind", ""))
++            age = float(beam.get("age", 99.0))
++            path = beam.get("path") or []
++            if kind not in ("laser", "lightning") or not path or age > 1.0:
++                continue
++            src = path[0]
++            if not isinstance(src, (list, tuple)) or len(src) < 2:
++                continue
++            dx, dy = float(src[0]) - float(mx), float(src[1]) - float(my)
++            distance = math.hypot(dx, dy)
++            bearing = math.atan2(dy, dx)
++            candidates.append((now - age, distance, bearing, kind, beam.get("by")))
++        # Prefer the most recent beam; if timestamps tie, prefer the nearer source.
++        if not candidates:
++            return
++        beam_t, distance, bearing, kind, by = max(candidates, key=lambda q: (q[0], -q[1]))
++        if beam_t + 1e-6 < self.last_threat_t:
++            return
++        self.last_threat_bearing = bearing
++        self.last_attacker_bearing = bearing
++        self.last_threat_t = beam_t
++        self.last_threat_kind = kind
++        self.last_threat_dist = "near" if distance < 60.0 else ("mid" if distance < 160.0 else "far")
++        if by is not None:
++            try:
++                self.last_attacker_id = int(by)
++            except (TypeError, ValueError):
++                pass
++
+     def _zone_goal(self, obs: mf.Observation, me: Dict[str, Any]) -> Vec2:
+         z = obs.get("zone", {})
+         pos = me["pos"]
+@@ -669,6 +710,19 @@
+                     if abs(den) > 1e-8:
+                         offset = clamp(0.025 * (d0-d2) / den, -0.05, 0.05)
+                         best_t = clamp(best_t + offset, 0.0, 0.9)
++                # Re-evaluate the complete relative position at the refined time.
++                # The previous implementation refined best_t but retained best_d
++                # and best_delta from the nearest 50 ms sample. That could miss a
++                # shell whose true closest pass was just inside the danger radius.
++                sx = float(pos[0]) + float(vel[0]) * best_t
++                sy = float(pos[1]) + float(vel[1]) * best_t
++                sz = float(pos[2]) + float(vel[2]) * best_t - 0.5 * gravity * best_t * best_t
++                mx = px + vx0 * best_t
++                my = py + vy0 * best_t
++                mz = pz + vz0 * best_t
++                best_d = math.sqrt((sx-mx)**2 + (sy-my)**2 +
++                                   (sz-(mz+mech_center_z))**2)
++                best_delta = (mx-sx, my-sy)
+                 radius = max(7.0, float(self.cfg.get("weapons", {}).get("mortar", {}).get("splash_radius", 7.0)) + 2.0)
+             else:
+                 # Exact closest point of approach for a linear projectile.
+@@ -689,6 +743,13 @@
+                 best_d = math.sqrt((sx-mx)**2 + (sy-my)**2 +
+                                    (sz-(mz+mech_center_z))**2)
+                 best_delta = (mx-sx, my-sy)
++                # If a solid/terrain ridge blocks the projectile's straight path
++                # to its predicted closest point, it cannot hit us along this
++                # trajectory. Do not waste a dodge by stepping out from cover.
++                if self._ray_blocked(
++                        (float(pos[0]), float(pos[1]), float(pos[2])),
++                        (sx, sy, sz)):
++                    continue
+                 projectile_cfg = self.cfg.get("projectile", {})
+                 projectile_radius = max(float(projectile_cfg.get("gun_radius", 0.3)),
+                                          float(projectile_cfg.get("npc_radius", 0.3)))
+@@ -951,6 +1012,7 @@
+                 rear_attacker_id = int(ev["by"])
+                 break
+ 
++        self._remember_beams(obs, me, t)
+         sound_threat = self._sound_threat(obs, me)
+         recent_alert = sound_threat is not None and self.last_threat_dist in ("near", "mid")
+         action: mf.Action = {"tick": obs["tick"]}
+@@ -1125,17 +1187,15 @@
+                 if float(w0.get("ammo", 0.0)) > 0 and float(w0.get("reload", 0.0)) <= 0.0:
+                     fire[0] = True
+         elif not enemies:
+-            # No visible target: turn toward the freshest directional threat.
++            # No visible target: use the freshest timestamp-ordered threat
++            # evidence (current damage event, beam source, or heard sound).
++            # _remember_beams and _sound_threat have already updated this memory;
++            # do not let an older sound in this observation override a newer beam.
+             bearing = None
+             for ev in reversed(obs.get("events", []) or []):
+                 if ev.get("type") == "damaged" and ev.get("bearing") is not None and ev.get("weapon") != "zone":
+                     bearing = float(ev["bearing"])
+                     break
+-            if bearing is None:
+-                sounds = [s for s in (obs.get("sounds", []) or []) if s.get("kind") in ("gun", "mortar", "explosion", "laser", "laser_charge", "lightning", "npc_gun") and float(s.get("age", 99.0)) < 0.45]
+-                if sounds:
+-                    sounds.sort(key=lambda s: float(s.get("age", 99.0)))
+-                    bearing = float(sounds[0].get("bearing", aim_yaw))
+             if bearing is None and self.last_threat_bearing is not None and t - self.last_threat_t < 2.0:
+                 bearing = self.last_threat_bearing
+             if bearing is not None:

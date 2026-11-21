@@ -1,42 +1,25 @@
-# Oval Ghost V7 — P0 correctness patch
+# Oval Ghost V8 — focused threat-awareness candidate
 
-V7 is a conservative patch on the V6 agent, which achieved a **2.67 practice score**. It deliberately keeps V6's overall strategy and focuses on specific correctness risks identified during an independent audit. It is an **unscored candidate** until the competition runs its 48-match practice evaluation.
+V8 is a narrow experimental patch based on V7 (practice score reported by the team: 2.71). It does **not** replace the best-known V7 build until V8 receives its own 48-match score.
 
-## Changes from V6
+## Changes from V7
 
-1. **Laser line-of-sight gate.** Do not begin a laser charge at a remembered target behind a solid. If a charge is already in progress and the target becomes occluded or disappears, rotate toward a prism-clear upward ray and release only after the torso is aligned with that safe direction. Gun fire in the laser branch is also suppressed when the target ray is blocked.
-2. **Mortar lead convergence.** Iterate target lead, ballistic pitch, and flight time together, recompute pitch at the final predicted target point, and remove the old 2.5 s time cap. The shell TTL from the live config supplies the flight-time bound.
-3. **Mortar path validation.** Check the early ballistic arc over the longer solved flight time with adaptive spatial sampling rather than truncating the path at 3 s.
-4. **Spatial-bin padding.** Expand prism indexing by 16 m so collision queries still find nearby edges for a large cube-grown mech. This is designed to cover the finite match cube supply (36 crate cubes + 24 NPC cubes + 9 supply-drop cubes + up to 30 kill-bonus cubes = 99 cubes; radius 14.875 m at 99 cubes).
-5. **Cover-ray height.** Use terrain height at the candidate cover point, falling back to the current feet height only when no terrain sample is available.
-6. **Lightning fallback cleanup.** Remove a duplicate fallback that could bypass the primary lightning branch's range/LOS/energy checks under altered weapon configs.
+1. **Mortar CPA consistency:** after refining the closest-approach time from the 50 ms samples, recompute the true 3D separation and lateral dodge vector at that refined time. V7 refined time but retained distance/direction from the coarse sample.
+2. **Projectile path occlusion:** for straight gun/NPC bullets, do not dodge when the projectile's current path to its predicted closest-approach point is blocked by a solid or terrain ridge. This is separate from tree vision because trees do not block shots.
+3. **Beam-based threat memory:** use observed laser/lightning beam source positions and shooter IDs to update the threat bearing when the beam is newer than existing damage/sound evidence. This helps orient toward the attacker when no mech is currently visible.
+4. **Timestamp ordering:** older sounds do not overwrite a newer beam/damage observation.
 
-## Build
+## Deliberately not included
 
-```sh
-docker build -t oval-ghost-v7 .
-```
+No new 24-direction steering, ORCA, rooftop planner, tree-vision model, or large strategy rewrite is included. Those need separate testing. This candidate preserves V7's broader action policy.
 
-The Dockerfile uses Python's standard library only and starts `bot.py` with unbuffered output.
-
-## Official conformance check
-
-From the extracted competition kit:
+## Build and test
 
 ```sh
-python3 check/check.py --map-dir /path/to/mechfight-kit/arena -- python3 -u /path/to/oval-ghost-v7/bot.py
+python3 check/check.py --map-dir /path/to/mechfight-kit/arena -- python3 -u bot.py
+python3 test_v8.py
 ```
-
-## Focused regression tests
-
-The included `test_v7.py` uses the official check stream and map. Set the kit directory before running:
-
-```sh
-MECHFIGHT_KIT_DIR=/path/to/mechfight-kit python3 test_v7.py
-```
-
-`MECHFIGHT_KIT_DIR` should point to the extracted directory containing `check/stream.jsonl.gz` and `arena/`.
 
 ## Submission policy
 
-Keep the V6 submission (2.67) as the best-known version unless V7's scored result is higher. Passing `check.py` verifies protocol/timing, not gameplay quality.
+V7's reported score of 2.71 remains the best-known result until V8's scored practice result is higher. The conformance check is not a gameplay simulation.

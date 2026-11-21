@@ -1,21 +1,14 @@
-# V7 audit notes
+# V8 engineering notes
 
-Source: V6 bot plus the independent Gemini audit supplied by the team.
+## Evidence-based changes
 
-## Applied P0 corrections
+- The V7 mortar CPA routine refined `best_t` with parabolic interpolation but left `best_d` and `best_delta` at the nearest 50 ms sample. A reproducible geometry with a true 8.95 m pass and a 9.0 m danger threshold showed the coarse sample could classify the shell as safe. V8 recomputes full relative position, distance, and lateral vector at the refined time.
+- Straight projectile CPA now checks whether the segment from the observed projectile position to its predicted closest-approach position intersects a building/bridge/terrain according to V7's existing `_ray_blocked` model. If obstructed, that projectile is not treated as a direct threat.
+- Visible laser/lightning beams expose a shooter ID and path whose first point is the shooter muzzle. V8 records the bearing from the mech to that muzzle and uses timestamp ordering so older sounds cannot overwrite newer beam/damage evidence.
 
-- Gate laser charge on unobstructed line of sight to the current target.
-- If an existing laser charge loses its target line, direct the torso along a clear upward ray and release only after aim alignment; also cover the case where the target disappears from the observation.
-- Solve mortar flight time and low-arc pitch iteratively without the previous 2.5-second cap; recompute the final pitch against the final lead point.
-- Extend mortar path checking to the full relevant flight interval with adaptive sample count.
-- Expand static prism spatial-bin padding to 16 m to account for cube-grown mech radius.
-- Sample terrain at candidate cover positions for line-of-sight height.
-- Remove the duplicate lightning fallback that bypassed the main branch's full checks.
+## Important limitations
 
-## Deliberately not included
-
-The V7 patch does not implement the larger P1/P2 proposals (24-slot context steering, ORCA/velocity obstacles, persistent enemy threat table, tree-occlusion cover scoring, or coarse A*). Those are larger strategic changes and should be tested separately after V7's result.
-
-## Important uncertainty
-
-The protocol gives the gun's projectile speed but does not explicitly state whether shooter velocity is inherited. The bot retains V6's consistent world-space projectile assumption; this needs empirical verification using observed projectile velocity while the mech is boosting laterally.
+- The projectile occlusion check is a straight-segment check and applies only to gun/NPC bullets, not ballistic mortar shells.
+- Beam data is event-like and only visible when the beam or part of it is in view; it is supplementary evidence, not persistent enemy localization.
+- The protocol does not explicitly specify whether shooter velocity is inherited by gun projectiles. V8 retains V7's internally consistent non-inherited world-space projectile assumption; this remains unverified.
+- No expected practice-score improvement is claimed. Only scored matches can establish that.
