@@ -74,7 +74,7 @@ def solve_intercept(r: Vec3, v: Vec3, speed: float, max_t: float = 2.5) -> float
 
 
 class Bot:
-    name = "Oval-Ghost-v4"
+    name = "Oval-Ghost-v5-hybrid"
 
     def __init__(self, hello: mf.Hello):
         self.hello = hello
@@ -137,34 +137,6 @@ class Bot:
             if not in_hole:
                 return True
         return False
-
-    def _steer(self, me: Dict[str, Any], goal: Vec2) -> Vec2:
-        x, y, z = me["pos"]
-        dx, dy = goal[0] - x, goal[1] - y
-        ux, uy = unit(dx, dy)
-        if ux == 0.0 and uy == 0.0:
-            return (0.0, 0.0)
-        height = float(me.get("stats", {}).get("eye_height", self.cfg.get("mech", {}).get("eye_height", 8.0)))
-        base_ang = math.atan2(uy, ux)
-        # Local angular search: route around nearby walls instead of repeatedly
-        # pushing directly into a building. The search is small enough for 50 ms.
-        offsets = [0, 22, -22, 45, -45, 70, -70, 100, -100, 135, -135, 180]
-        best_score = -1e30
-        best = (ux, uy)
-        for off in offsets:
-            a = base_ang + math.radians(off)
-            vx, vy = math.cos(a), math.sin(a)
-            hits = 0.0
-            # Test several points along the proposed movement segment.
-            for d in (4.0, 8.0, 13.0, 19.0):
-                if self._blocked(x + vx * d, y + vy * d, z, height):
-                    hits += (1.0 if d <= 8.0 else 0.65)
-            alignment = vx * ux + vy * uy
-            # Prefer progress, strongly penalize walking into solids.
-            score = 3.0 * alignment - 5.0 * hits
-            if score > best_score:
-                best_score, best = score, (vx, vy)
-        return best
 
     def _ray_blocked(self, a: Vec3, b: Vec3) -> bool:
         """Approximate a weapon/vision ray against static building prisms."""
@@ -298,6 +270,35 @@ class Bot:
                 best_score, best = score, q
         return best
 
+
+    def _steer(self, me: Dict[str, Any], goal: Vec2) -> Vec2:
+        x, y, z = me["pos"]
+        dx, dy = goal[0] - x, goal[1] - y
+        ux, uy = unit(dx, dy)
+        if ux == 0.0 and uy == 0.0:
+            return (0.0, 0.0)
+        height = float(me.get("stats", {}).get("eye_height", self.cfg.get("mech", {}).get("eye_height", 8.0)))
+        base_ang = math.atan2(uy, ux)
+        # Local angular search: route around nearby walls instead of repeatedly
+        # pushing directly into a building. The search is small enough for 50 ms.
+        offsets = [0, 22, -22, 45, -45, 70, -70, 100, -100, 135, -135, 180]
+        best_score = -1e30
+        best = (ux, uy)
+        for off in offsets:
+            a = base_ang + math.radians(off)
+            vx, vy = math.cos(a), math.sin(a)
+            hits = 0.0
+            # Test several points along the proposed movement segment.
+            for d in (4.0, 8.0, 13.0, 19.0):
+                if self._blocked(x + vx * d, y + vy * d, z, height):
+                    hits += (1.0 if d <= 8.0 else 0.65)
+            alignment = vx * ux + vy * uy
+            # Prefer progress, strongly penalize walking into solids.
+            score = 3.0 * alignment - 5.0 * hits
+            if score > best_score:
+                best_score, best = score, (vx, vy)
+        return best
+
     def _sound_threat(self, obs: mf.Observation, me: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Convert recent directional sounds into a temporary approximate threat."""
         t = float(obs.get("t", 0.0))
@@ -319,50 +320,29 @@ class Bot:
                         y + math.sin(self.last_threat_bearing)*d, z],
                 "vel": [0.0, 0.0, 0.0], "sound_kind": self.last_threat_kind}
 
+
     def _zone_goal(self, obs: mf.Observation, me: Dict[str, Any]) -> Vec2:
-        """Rotate along an inner safe-zone arc instead of beelining to its centre."""
-        zone = obs.get("zone", {})
-        x, y = float(me["pos"][0]), float(me["pos"][1])
-        center = zone.get("center", [0.0, 0.0])
-        next_c = zone.get("next_center", center)
-        radius = float(zone.get("radius", 9999.0))
-        next_r = float(zone.get("next_radius", radius))
+        z = obs.get("zone", {})
+        pos = me["pos"]
+        center = z.get("center", [0.0, 0.0])
+        next_c = z.get("next_center", center)
+        radius = float(z.get("radius", 9999.0))
+        next_r = float(z.get("next_radius", radius))
         t = float(obs.get("t", 0.0))
-        shrink_start = float(zone.get("shrink_start", 1e9))
-        shrink_end = float(zone.get("shrink_end", 1e9))
-        d_now = dist2((x, y), center)
-        d_next = dist2((x, y), next_c)
-
-        # If the present circle is already unsafe, move well inside it immediately.
-        if not me.get("in_zone", True) or d_now > radius - 18.0:
-            if radius <= 28.0:
-                return (float(center[0]), float(center[1]))
-            a = math.atan2(y-float(center[1]), x-float(center[0]))
-            r_goal = min(radius*0.52, radius-28.0)
-            return (float(center[0]) + math.cos(a)*r_goal,
-                    float(center[1]) + math.sin(a)*r_goal)
-
-        # Move ahead of the next shrink, using a protected inner arc with margin.
-        urgency = clamp((t - (shrink_start - 17.0)) / max(1.0, shrink_end - (shrink_start - 17.0)), 0.0, 1.0)
-        next_margin = min(30.0, max(8.0, next_r*0.18))
-        if urgency > 0.05 or d_next > next_r - next_margin - 8.0:
-            if next_r <= 30.0:
-                return (float(next_c[0]), float(next_c[1]))
-            a = math.atan2(y-float(next_c[1]), x-float(next_c[0]))
-            a += self.strafe_sign * 0.12
-            r_goal = min(next_r*0.62, next_r-next_margin)
-            return (float(next_c[0]) + math.cos(a)*r_goal,
-                    float(next_c[1]) + math.sin(a)*r_goal)
-
-        # While the current zone is holding, patrol a short arc at the current radius.
-        if radius <= 35.0:
+        d_now = dist2(pos, center)
+        d_next = dist2(pos, next_c)
+        # If outside the current ring, immediately return. Otherwise drift into
+        # the next ring before the damaging shrink begins.
+        if d_now > radius - 8.0 or not me.get("in_zone", True):
             return (float(center[0]), float(center[1]))
-        a = math.atan2(y-float(center[1]), x-float(center[0]))
-        r_goal = min(max(d_now, min(45.0, radius*0.35)), radius-32.0)
-        angular_step = min(0.24, 34.0 / max(45.0, r_goal))
-        a += self.strafe_sign * angular_step
-        return (float(center[0]) + math.cos(a)*r_goal,
-                float(center[1]) + math.sin(a)*r_goal)
+        shrink_start = float(z.get("shrink_start", 1e9))
+        shrink_end = float(z.get("shrink_end", 1e9))
+        urgency = clamp((t - (shrink_start - 18.0)) / max(1.0, shrink_end - (shrink_start - 18.0)), 0.0, 1.0)
+        # Begin moving toward the next circle when nearing its boundary or when
+        # the shrink is approaching. Do not over-travel if already well inside.
+        if d_next > max(15.0, next_r * 0.72) or urgency > 0.15:
+            return (float(next_c[0]), float(next_c[1]))
+        return (float(center[0]), float(center[1]))
 
     def _choose_resource_goal(self, obs: mf.Observation, me: Dict[str, Any], enemies: List[Dict[str, Any]], zone_goal: Vec2) -> Tuple[Vec2, Optional[Dict[str, Any]], str]:
         x, y, z = me["pos"]
@@ -414,11 +394,10 @@ class Bot:
             dd = dist2((x, y), p.get("pos", [x, y, z]))
             if dd > 60.0 or nearest_enemy < 30.0:
                 continue
-            pref = {"laser": 81.0, "mortar": 67.0, "lightning": 88.0}.get(kind, 50.0)
-            if kind == "laser" and nearest_enemy > 105.0:
-                pref += 7.0
-            if kind == "lightning" and nearest_enemy < 105.0:
-                pref += 9.0
+            if nearest_enemy < 70.0:
+                pref = {"lightning": 88.0, "mortar": 76.0, "laser": 67.0}.get(kind, 50.0)
+            else:
+                pref = {"laser": 86.0, "mortar": 75.0, "lightning": 70.0}.get(kind, 50.0)
             score = pref - 0.9 * dd
             candidates.append((score, (float(p["pos"][0]), float(p["pos"][1])), p, "weapon"))
 
@@ -492,10 +471,7 @@ class Bot:
         tv = target.get("vel", [0.0, 0.0, 0.0])
         mv = me.get("vel", [0.0, 0.0, 0.0])
         cubes = float(target.get("cubes", 0.0))
-        if target.get("kind") == "npc":
-            target_center_z = tz + 1.75
-        else:
-            target_center_z = tz + 4.5 * (1.0 + 0.05 * cubes)
+        target_center_z = tz + (1.75 if target.get("kind") == "npc" else 4.5 * (1.0 + 0.05 * cubes))
         muzzle_z = mz + float(me.get("stats", {}).get("muzzle_height", 7.0))
         speed = float(weapon.get("stats", {}).get("speed", 252.0))
         if kind == "gun":
@@ -592,20 +568,21 @@ class Bot:
         me = obs["self"]
         x, y, z = me["pos"]
         t = float(obs.get("t", 0.0))
-        all_actors = obs.get("mechs", []) or []
-        enemies = [m for m in all_actors if m.get("kind") == "mech"]
-        npcs = [m for m in all_actors if m.get("kind") == "npc"]
+        actors = obs.get("mechs", []) or []
+        enemies = [m for m in actors if m.get("kind") == "mech"]
+        npcs = [m for m in actors if m.get("kind") == "npc"]
         enemies.sort(key=lambda e: dist3(e["pos"], me["pos"]))
         npcs.sort(key=lambda e: dist3(e["pos"], me["pos"]))
         nearby = [e for e in enemies if dist3(e["pos"], me["pos"]) < 100.0]
         hp_frac = float(me.get("hp", 1.0)) / max(1.0, float(me.get("max_hp", 1.0)))
         energy = float(me.get("energy", 0.0))
         max_energy = max(1.0, float(me.get("max_energy", 100.0)))
+        nearest_enemy_dist = dist3(enemies[0]["pos"], me["pos"]) if enemies else 9999.0
+        nearest_npc_dist = dist3(npcs[0]["pos"], me["pos"]) if npcs else 9999.0
 
-        # Persist the last attacker and fresh sound direction across observations.
+        # Track both damage dealt and received: either resets the regeneration timer.
         for ev in obs.get("events", []) or []:
             if ev.get("type") in ("damaged", "hit"):
-                # Regen resets both when we take damage and when we successfully deal it.
                 self.last_damage_t = t
             if ev.get("type") == "damaged":
                 if ev.get("bearing") is not None and ev.get("weapon") != "zone":
@@ -618,94 +595,61 @@ class Bot:
                     self.last_attacker_id = int(ev["by"])
 
         sound_threat = self._sound_threat(obs, me)
-        threats = list(enemies[:4])
-        if sound_threat is not None and sound_threat not in threats:
-            threats.append(sound_threat)
-        nearest_enemy_dist = dist3(enemies[0]["pos"], me["pos"]) if enemies else 9999.0
-        nearest_npc_dist = dist3(npcs[0]["pos"], me["pos"]) if npcs else 9999.0
-
+        recent_alert = sound_threat is not None and self.last_threat_dist in ("near", "mid")
         action: mf.Action = {"tick": obs["tick"]}
         if obs.get("offer"):
             action["pick"] = self._choose_upgrade(obs["offer"], me)
+
+        # Choose a combat target; close and weakened opponents are more valuable.
+        target = None
+        if enemies:
+            def target_score(e: Dict[str, Any]) -> float:
+                d = dist3(e["pos"], me["pos"])
+                ehp = float(e.get("hp", e.get("max_hp", 900.0)))
+                return d + 0.018 * ehp - (10.0 if e.get("charging") else 0.0)
+            target = min(enemies, key=target_score)
+            self.last_target = int(target.get("id", -1))
+
+        # Opportunistic drone farming: two cubes are valuable, but do not detour
+        # toward a drone while a mech is close or directional weapon sounds are recent.
+        if (target is None and npcs and nearest_npc_dist < 68.0
+                and nearest_enemy_dist > 145.0 and hp_frac > 0.66
+                and me.get("in_zone", True) and not recent_alert):
+            target = npcs[0]
 
         zone_goal = self._zone_goal(obs, me)
         resource_goal, resource_obj, resource_kind = self._choose_resource_goal(obs, me, enemies, zone_goal)
         goal = resource_goal
 
-        # Cover has priority over loot whenever a visible or recently heard threat can see us.
-        exposed_threats = [e for e in enemies if dist3(e["pos"], me["pos"]) < 205.0 and not self._covered_from(me, e)]
-        sound_is_close = sound_threat is not None and self.last_threat_dist in ("near", "mid")
-        if sound_is_close:
-            sp = sound_threat["pos"]
-            if not self._covered_from(me, sound_threat):
-                exposed_threats.append(sound_threat)
-        cover_goal = self._cover_goal(obs, me, exposed_threats) if exposed_threats else None
+        # Use cover only when there is a concrete reason: close line-of-sight threats,
+        # multiple nearby mechs, or very recent damage. This changes movement, not firing.
+        exposed_threats = [e for e in enemies
+                           if dist3(e["pos"], me["pos"]) < 155.0 and not self._covered_from(me, e)]
+        cover_trigger = (hp_frac < 0.68 or len(nearby) >= 2 or
+                         (t - self.last_damage_t) < 0.9 or nearest_enemy_dist < 62.0)
+        cover_goal = self._cover_goal(obs, me, exposed_threats) if (cover_trigger and exposed_threats) else None
         if cover_goal is not None:
             goal = cover_goal
             resource_obj = None
             resource_kind = "cover"
 
-        # Regeneration is unusually valuable: no damage/dealing for 5 s restores 45 HP/s.
-        no_recent_damage = (t - self.last_damage_t) >= 5.0
-        recovering = (hp_frac < 0.82 and no_recent_damage and me.get("in_zone", True)
-                      and nearest_enemy_dist > 118.0 and not exposed_threats
-                      and not sound_is_close)
-
-        # Select an enemy mech only when it is a genuine threat or a high-value opportunity.
-        target: Optional[Dict[str, Any]] = None
-        if enemies:
-            def enemy_score(e: Dict[str, Any]) -> float:
-                d = dist3(e["pos"], me["pos"])
-                ehp = float(e.get("hp", e.get("max_hp", 900.0)))
-                return d + 0.018 * ehp - (16.0 if e.get("charging") else 0.0)
-            candidate = min(enemies, key=enemy_score)
-            d_candidate = dist3(candidate["pos"], me["pos"])
-            was_attacker = (self.last_attacker_id is not None
-                            and int(candidate.get("id", -999)) == self.last_attacker_id
-                            and t - self.last_damage_t < 9.0)
-            if (d_candidate <= 132.0 or candidate.get("charging") or was_attacker
-                    or (float(candidate.get("hp", 9999.0)) < 300.0 and d_candidate < 175.0)):
-                target = candidate
-                self.last_target = int(target.get("id", -1))
-
-        # Farm a drone only when no mech is close enough to punish the detour.
-        if target is None and npcs and nearest_enemy_dist > 112.0 and hp_frac > 0.58 and me.get("in_zone", True):
-            n = npcs[0]
-            nd = dist3(n["pos"], me["pos"])
-            if nd < 92.0:
-                target = n
-                if resource_kind in ("zone", "crate"):
-                    goal = (float(n["pos"][0]), float(n["pos"][1]))
-                    if resource_kind == "crate":
-                        resource_obj = None
-                    resource_kind = "npc"
-
-        # During recovery, do not farm or start optional fights. Still defend at close range.
-        if recovering and (target is None or (target.get("kind") == "npc")
-                           or dist3(target["pos"], me["pos"]) > 42.0):
-            target = None
-            if cover_goal is None:
-                # Stay still to bank regeneration unless a zone rotation is genuinely due.
-                zone = obs.get("zone", {})
-                rotate_due = (not me.get("in_zone", True)
-                              or t >= float(zone.get("shrink_start", 1e9)) - 10.0
-                              and dist2((x, y), zone_goal) > 35.0)
-                goal = zone_goal if rotate_due else (x, y)
+        # Recover only when genuinely safe and not in an active engagement.
+        # Keep this narrow so it cannot suppress self-defence against visible mechs.
+        recovering = (hp_frac < 0.78 and (t - self.last_damage_t) >= 5.0
+                      and not enemies and me.get("in_zone", True)
+                      and not recent_alert and nearest_npc_dist > 75.0)
+        if recovering and cover_goal is None:
+            goal = (float(x), float(y))
             resource_obj = None
             resource_kind = "recover"
 
-        utility_target = resource_obj if target is None and resource_kind == "crate" else None
+        # If a crate was selected, shoot it while moving toward it. Crate fire is
+        # deliberately lower priority than any visible hostile mech.
+        utility_target = None
+        if target is None and resource_kind == "crate" and not recovering:
+            utility_target = resource_obj
 
-        # Only fire direct weapons when a solid does not block the muzzle-to-target ray.
-        line_clear = False
-        if target is not None:
-            tp = target["pos"]
-            muzzle_z = z + float(me.get("stats", {}).get("muzzle_height", 7.0))
-            center_z = float(tp[2]) + (1.75 if target.get("kind") == "npc" else 4.5)
-            line_clear = not self._ray_blocked((x, y, muzzle_z),
-                                               (float(tp[0]), float(tp[1]), center_z))
-
-        # Aim and fire. Preserve V1's active firing logic; avoid optional long-range duels.
+        # Aim/weapon choice.
         aim_yaw = math.atan2(zone_goal[1] - y, zone_goal[0] - x)
         aim_pitch = 0.0
         fire = [False, False]
@@ -717,116 +661,118 @@ class Bot:
         if current_target is not None:
             d = dist3(current_target["pos"], me["pos"])
             second_kind = w1.get("kind") if w1 else None
-            direct_ok = line_clear
             if second_kind == "mortar" and 30.0 < d < 220.0:
-                aim_yaw, aim_pitch, _ = self._mortar_aim(me, current_target, w1)
+                aim_yaw, aim_pitch, hrange = self._mortar_aim(me, current_target, w1)
                 err = abs(wrap(aim_yaw - float(me.get("aim", [aim_yaw, 0.0])[0])))
                 if float(w1.get("cooldown", 0.0)) <= 0.02 and err < 0.35:
                     fire[1] = True
-            elif second_kind == "laser" and d > 38.0 and direct_ok:
-                # Laser charge is visible; prefer to release a useful shot but do not charge through cover.
-                aim_yaw, aim_pitch, _ = self._target_aim(me, current_target, w1, "laser")
+            elif second_kind == "laser" and d > 38.0 and not any("lightning" in (e.get("weapons") or []) for e in nearby if dist3(e["pos"], me["pos"]) < 65.0):
+                aim_yaw, aim_pitch, hrange = self._target_aim(me, current_target, w1, "laser")
                 charge = float(w1.get("charge", 0.0))
                 cooldown = float(w1.get("cooldown", 0.0))
                 if cooldown <= 0.02:
+                    # Charge to ~0.65 s then release. The full-charge auto-fire
+                    # is avoided so the beam is released on a deliberate tick.
                     fire[1] = charge < 0.64
-                if w0 and d < float(w0.get("stats", {}).get("range", 230.0)) and line_clear:
+                # Gun and laser share aim; a gun shot is also useful while the
+                # laser charges, but only when the enemy is in gun range.
+                if w0 and d < float(w0.get("stats", {}).get("range", 230.0)):
                     gy, gp, _ = self._target_aim(me, current_target, w0, "gun")
-                    if abs(wrap(gy-aim_yaw)) < 0.07 and abs(gp-aim_pitch) < 0.07:
+                    if abs(wrap(gy - aim_yaw)) < 0.07 and abs(gp - aim_pitch) < 0.07:
                         if float(w0.get("reload", 0.0)) <= 0.0 and float(w0.get("ammo", 1.0)) > 0:
                             fire[0] = True
-            elif second_kind == "lightning" and d <= float(w1.get("stats", {}).get("range", 45.0))*1.08 and direct_ok:
-                aim_yaw, aim_pitch, _ = self._target_aim(me, current_target, w1, "lightning")
-                yaw_err = abs(wrap(aim_yaw-float(me.get("aim", [aim_yaw, 0.0])[0])))
-                if (yaw_err < math.radians(23.0) and float(w1.get("cooldown", 0.0)) <= 0.02
-                        and energy >= float(w1.get("stats", {}).get("energy", 3.0))):
+            elif second_kind == "lightning" and d <= float(w1.get("stats", {}).get("range", 45.0)) * 1.08:
+                # Lightning is instant and only cares about yaw/cone.
+                aim_yaw, aim_pitch, hrange = self._target_aim(me, current_target, w1, "lightning")
+                yaw_err = abs(wrap(aim_yaw - float(me.get("aim", [aim_yaw, 0.0])[0])))
+                if yaw_err < math.radians(23.0) and float(w1.get("cooldown", 0.0)) <= 0.02 and energy >= float(w1.get("stats", {}).get("energy", 3.0)):
                     fire[1] = True
-                if w0 and d < float(w0.get("stats", {}).get("range", 230.0)) and line_clear:
+                if w0 and d < float(w0.get("stats", {}).get("range", 230.0)):
                     gy, gp, _ = self._target_aim(me, current_target, w0, "gun")
-                    if abs(wrap(gy-aim_yaw)) < 0.08 and abs(gp-aim_pitch) < 0.08:
+                    if abs(wrap(gy - aim_yaw)) < 0.08 and abs(gp - aim_pitch) < 0.08:
                         if float(w0.get("reload", 0.0)) <= 0.0 and float(w0.get("ammo", 1.0)) > 0:
                             fire[0] = True
             else:
-                if w0 and line_clear:
+                # Gun-only attack, including when a secondary is out of range.
+                if w0:
                     aim_yaw, aim_pitch, hrange = self._target_aim(me, current_target, w0, "gun")
-                    yaw_err = abs(wrap(aim_yaw-float(me.get("aim", [aim_yaw, 0.0])[0])))
-                    pitch_err = abs(aim_pitch-float(me.get("aim", [aim_yaw, 0.0])[1]))
-                    if (hrange <= float(w0.get("stats", {}).get("range", 230.0))
-                            and yaw_err < 0.18 and pitch_err < 0.18):
+                    yaw_err = abs(wrap(aim_yaw - float(me.get("aim", [aim_yaw, 0.0])[0])))
+                    pitch_err = abs(aim_pitch - float(me.get("aim", [aim_yaw, 0.0])[1]))
+                    if hrange <= float(w0.get("stats", {}).get("range", 230.0)) and yaw_err < 0.18 and pitch_err < 0.18:
                         if float(w0.get("ammo", 0.0)) > 0 and float(w0.get("reload", 0.0)) <= 0.0:
                             fire[0] = True
-                if w1 and w1.get("kind") == "lightning" and d <= 45.0 and line_clear:
+                # If the secondary can contribute at short range and is not a
+                # laser/mortar, use it when aligned.
+                if w1 and w1.get("kind") == "lightning" and d <= 45.0:
                     ly, lp, _ = self._target_aim(me, current_target, w1, "lightning")
-                    if (abs(wrap(ly-float(me.get("aim", [ly, 0.0])[0]))) < math.radians(23.0)
-                            and float(w1.get("cooldown", 0.0)) <= 0.02 and energy >= 3.0):
+                    if abs(wrap(ly - float(me.get("aim", [ly, 0.0])[0]))) < math.radians(23) and float(w1.get("cooldown", 0.0)) <= 0.02 and energy >= 3.0:
                         aim_yaw, aim_pitch = ly, lp
                         fire[1] = True
-        elif utility_target is not None and w0 and not recovering:
-            p0 = utility_target.get("pos", [x, y, z])
-            dx, dy = p0[0]-x, p0[1]-y
+        elif utility_target is not None and w0:
+            # Crate center is roughly 1.2 m above its base; it is stationary.
+            p = utility_target.get("pos", [x, y, z])
+            dx, dy = p[0] - x, p[1] - y
             aim_yaw = math.atan2(dy, dx)
-            aim_pitch = math.atan2((p0[2]+1.2)-(z+float(me.get("stats", {}).get("muzzle_height", 7.0))),
-                                   max(0.1, math.hypot(dx, dy)))
-            err = abs(wrap(aim_yaw-float(me.get("aim", [aim_yaw, 0.0])[0])))
+            aim_pitch = math.atan2((p[2] + 1.2) - (z + float(me.get("stats", {}).get("muzzle_height", 7.0))), max(0.1, math.hypot(dx, dy)))
+            err = abs(wrap(aim_yaw - float(me.get("aim", [aim_yaw, 0.0])[0])))
             if math.hypot(dx, dy) < float(w0.get("stats", {}).get("range", 230.0)) and err < 0.18:
                 if float(w0.get("ammo", 0.0)) > 0 and float(w0.get("reload", 0.0)) <= 0.0:
                     fire[0] = True
-        else:
-            # When not committing to a fight, face the latest directional threat without firing.
-            bearing = self.last_threat_bearing
+        elif not enemies:
+            # No visible target: turn toward the freshest directional threat.
+            bearing = None
+            for ev in reversed(obs.get("events", []) or []):
+                if ev.get("type") == "damaged" and ev.get("bearing") is not None and ev.get("weapon") != "zone":
+                    bearing = float(ev["bearing"])
+                    break
             if bearing is None:
-                bearing = math.atan2(goal[1]-y, goal[0]-x)
-            aim_yaw, aim_pitch = bearing, 0.0
+                sounds = [s for s in (obs.get("sounds", []) or []) if s.get("kind") in ("gun", "mortar", "explosion", "laser", "laser_charge", "lightning") and float(s.get("age", 99.0)) < 0.45]
+                if sounds:
+                    sounds.sort(key=lambda s: float(s.get("age", 99.0)))
+                    bearing = float(sounds[0].get("bearing", aim_yaw))
+            if bearing is None and self.last_threat_bearing is not None and t - self.last_threat_t < 2.0:
+                bearing = self.last_threat_bearing
+            if bearing is not None:
+                aim_yaw, aim_pitch = bearing, 0.0
 
-        if recovering:
-            fire = [False, False]
+        # Reload early when there is no magazine left. Never spam reload while one is active.
         if w0 and float(w0.get("ammo", 1.0)) <= 0.0 and float(w0.get("reload", 0.0)) <= 0.0:
             action["reload"] = True
 
-        # Movement: evade projectiles first, otherwise use cover/resource/zone objectives.
+        # Movement: resource/zone objective, local wall avoidance, and threat response.
         move = self._steer(me, goal)
         dodge, urgent, jump = self._incoming_threat(obs, me)
         boost = False
         if urgent:
-            move = unit(move[0]*0.25 + dodge[0]*1.5, move[1]*0.25 + dodge[1]*1.5)
+            move = unit(move[0] * 0.25 + dodge[0] * 1.5, move[1] * 0.25 + dodge[1] * 1.5)
             boost = energy > 12.0
         else:
-            if cover_goal is not None:
-                # Commit to getting behind the structure; don't orbit toward the attacker.
-                dcover = dist2((x, y), cover_goal)
-                boost = dcover > 28.0 and energy > 38.0 and (hp_frac < 0.55 or nearest_enemy_dist < 90.0)
-            elif nearby:
+            # Avoid being surrounded or chased when health is low. In healthier
+            # states, orbit the nearest attacker to make leading shots harder.
+            if nearby:
                 nearest = min(nearby, key=lambda e: dist3(e["pos"], me["pos"]))
-                ex, ey = unit(x-nearest["pos"][0], y-nearest["pos"][1])
+                ex, ey = unit(x - nearest["pos"][0], y - nearest["pos"][1])
                 nd = dist2((x, y), nearest["pos"])
                 if hp_frac < 0.58 or len(nearby) >= 3:
                     weight = 1.2 if hp_frac < 0.58 else 0.75
-                    move = unit(move[0]+ex*weight, move[1]+ey*weight)
-                elif nd < 85.0 and not recovering:
-                    tangent = (-ey*self.strafe_sign, ex*self.strafe_sign)
-                    move = unit(move[0]*0.65+tangent[0]*0.75, move[1]*0.65+tangent[1]*0.75)
-                boost = energy > 48.0 and (nd < 55.0 or (hp_frac < 0.35 and nd < 100.0))
-            else:
-                dist_goal = dist2((x, y), goal)
-                outside = not me.get("in_zone", True)
-                boost = energy > 55.0 and (outside or (dist_goal > 115.0 and energy > 78.0))
+                    move = unit(move[0] + ex * weight, move[1] + ey * weight)
+                elif nd < 85.0:
+                    tangent = (-ey * self.strafe_sign, ex * self.strafe_sign)
+                    move = unit(move[0] * 0.65 + tangent[0] * 0.75, move[1] * 0.65 + tangent[1] * 0.75)
+            # Use boost sparingly: zone escape and short high-value rotations.
+            dist_goal = dist2((x, y), goal)
+            outside = not me.get("in_zone", True)
+            boost = energy > 48.0 and (outside or (dist_goal > 90.0 and energy > 72.0))
+            if hp_frac < 0.3 and nearby and energy > 18.0:
+                boost = True
 
-        # If safely recovering, stop moving/firing and bank regeneration; respect imminent zone rotation.
-        if recovering and not urgent and cover_goal is None:
-            zone = obs.get("zone", {})
-            rotate_due = (not me.get("in_zone", True)
-                          or (t >= float(zone.get("shrink_start", 1e9))-10.0
-                              and dist2((x, y), zone_goal) > 38.0))
-            if not rotate_due and nearest_enemy_dist > 75.0:
-                move = (0.0, 0.0)
-                boost = False
+        # If health recovery is safe, stop briefly to bank regeneration. Never do
+        # this outside zone, near visible enemies, or while evading a projectile.
+        if recovering and not urgent and not enemies and me.get("in_zone", True):
+            move = (0.0, 0.0)
+            boost = False
 
-        # Quiet final approach: command <5 m/s when near cover and not being chased.
-        if cover_goal is not None and not urgent and nearest_enemy_dist > 62.0:
-            if dist2((x, y), cover_goal) < 24.0:
-                move = (move[0]*0.35, move[1]*0.35)
-
-        # Face the last attacker if a rear hit occurred; torso and legs are independent.
+        # A mech that gets damaged from behind should turn its torso toward the source.
         for ev in reversed(obs.get("events", []) or []):
             if ev.get("type") == "damaged" and ev.get("bearing") is not None:
                 if ev.get("rear") or target is None:
@@ -841,20 +787,22 @@ class Bot:
             "fire": [bool(fire[0]), bool(fire[1])],
         })
 
+        # Explicitly take nearby weapon pickups; movement goal gets us there first.
         if resource_kind == "weapon" and resource_obj is not None:
-            wp = resource_obj.get("pos", [x, y, z])
-            if (dist2((x, y), wp) <= float(self.cfg.get("loot", {}).get("pickup_radius", 4.0))+0.5
-                    and abs(z-wp[2]) <= 4.0):
+            p = resource_obj.get("pos", [x, y, z])
+            if dist2((x, y), p) <= float(self.cfg.get("loot", {}).get("pickup_radius", 4.0)) + 0.5 and abs(z - p[2]) <= 4.0:
                 action["take"] = resource_obj.get("id")
 
+        # Keep debug output small; this is useful in the spectator/debug tooling.
         if target is not None:
             tp = target["pos"]
-            mf.draw.line([x, y, z+7.0], [tp[0], tp[1], tp[2]+(2.0 if target.get("kind") == "npc" else 4.5)], "#ff5040")
+            target_h = 1.75 if target.get("kind") == "npc" else 4.5
+            mf.draw.line([x, y, z + 7.0], [tp[0], tp[1], tp[2] + target_h], "#ff5040")
         if cover_goal is not None:
             mf.draw.point([cover_goal[0], cover_goal[1], z], "#40d080", 6)
         mf.draw.point([goal[0], goal[1], z], "#40c0ff", 5)
         mode = "recover" if recovering else ("cover" if cover_goal is not None else resource_kind)
-        mf.draw.label(f"hp {int(me.get('hp', 0))} | {len(enemies)} mech | {mode}")
+        mf.draw.label(f"hp {int(me.get('hp', 0))} | {len(enemies)} seen | {mode}")
         return action
 
 
