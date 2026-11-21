@@ -1,4 +1,4 @@
-"""Oval Sentinel V2 - survival, map navigation, cover, loot and tactical combat.
+"""Oval Sentinel V3.1 - proactive zone rotation, map navigation, survival and tactical combat.
 
 Standard-library-only agent for mechfight/1.  The official wrapper handles JSONL I/O.
 """
@@ -391,7 +391,7 @@ class World:
 
 
 class Bot:
-    name = 'Oval-Sentinel-V2'
+    name = 'Oval-Sentinel-V3.1'
 
     def __init__(self, hello: mf.Hello):
         self.cfg = hello.get('config', {})
@@ -414,6 +414,8 @@ class Bot:
         self.last_weapon_kind: Optional[str] = None
         self.tick_count = 0
         self.strafe_sign = -1.0 if self.rng.random() < 0.5 else 1.0
+        self.roam_goal: Optional[Vec2] = None
+        self.roam_until = -1.0
 
     # -------- zone and navigation --------
     def _future_circle(self, obs: Dict[str, Any], horizon: float = 8.0) -> Tuple[Vec2, float]:
@@ -436,22 +438,46 @@ class Bot:
                 r + (nr-r)*f)
 
     def _zone_goal(self, obs: Dict[str, Any], me: Dict[str, Any]) -> Optional[Vec2]:
+        """Rotate early toward the next circle instead of waiting at spawn.
+
+        V2's low score and replay audit exposed a major policy weakness: when no
+        enemy or visible pickup was present, it could hold position for long
+        stretches. The next safe circle is already known, so make a conservative
+        point inside it the default strategic anchor. This gives time to travel
+        before the shrink starts and avoids camping at the outer rim.
+        """
         x, y = float(me['pos'][0]), float(me['pos'][1])
         z = obs.get('zone', {})
         c = z.get('center', [0.0, 0.0])
+        nc = z.get('next_center', c)
         r = float(z.get('radius', 9999.0))
-        fc, fr = self._future_circle(obs, 10.0)
-        dc = d2((x,y), c)
-        df = d2((x,y), fc)
-        # A 20-28m buffer prevents edge damage from small pathing errors.
-        if not me.get('in_zone', True) or dc > r - 12.0:
-            return (float(c[0]), float(c[1]))
-        if df > fr - 24.0:
-            ux, uy = unit(x-fc[0], y-fc[1])
+        nr = float(z.get('next_radius', r))
+        dc = d2((x, y), c)
+        dn = d2((x, y), nc)
+
+        # If outside the active ring, head straight into the next ring (which is
+        # wholly contained in the current ring) rather than camping at its edge.
+        # Otherwise start rotating early whenever we are outside the inner 62%
+        # of the next ring. The anchor is at 50% radius for a safety margin.
+        if not me.get('in_zone', True) or dc > r - 12.0 or dn > max(8.0, nr * 0.62):
+            ux, uy = unit(x - float(nc[0]), y - float(nc[1]))
             if ux == 0.0 and uy == 0.0:
                 ux, uy = 1.0, 0.0
-            safe_r = max(0.0, fr - 32.0)
-            return (fc[0] + ux*safe_r, fc[1] + uy*safe_r)
+            safe_r = max(0.0, nr * 0.50)
+            return (float(nc[0]) + ux * safe_r, float(nc[1]) + uy * safe_r)
+
+        # During the active shrink, keep a margin inside the moving circle too.
+        t = float(obs.get('t', 0.0))
+        ss = float(z.get('shrink_start', 1e9))
+        if t >= ss:
+            fc, fr = self._future_circle(obs, 14.0)
+            df = d2((x, y), fc)
+            if df > max(6.0, fr * 0.62):
+                ux, uy = unit(x - fc[0], y - fc[1])
+                if ux == 0.0 and uy == 0.0:
+                    ux, uy = 1.0, 0.0
+                safe_r = max(0.0, fr * 0.48)
+                return (fc[0] + ux * safe_r, fc[1] + uy * safe_r)
         return None
 
     def _inside_predicted_zone(self, obs: Dict[str, Any], p: Vec2) -> bool:
@@ -460,6 +486,66 @@ class Bot:
         r = float(z.get('radius', 9999.0))
         fc, fr = self._future_circle(obs, 8.0)
         return d2(p,c) < r-8.0 and d2(p,fc) < fr-18.0
+
+    def _roam_goal(self, obs: Dict[str, Any], me: Dict[str, Any], enemies: List[Dict[str, Any]], hp_frac: float) -> Optional[Vec2]:
+        """Choose a conservative exploration waypoint when no useful local objective exists.
+
+        V2 otherwise held position indefinitely when no visible loot, zone pressure,
+        or close enemy existed. This bounded patrol keeps the mech discovering loot
+        while preferring safe, open cells inside the forecast circle.
+        """
+        x, y = float(me['pos'][0]), float(me['pos'][1])
+        t = float(obs.get('t', 0.0))
+        nearest = self._nearest_enemy_dist(me, enemies)
+
+        # Do not wander while badly hurt or while a threat is close enough to punish it.
+        if nearest < 125.0:
+            return None
+        if hp_frac < 0.55 and (t - self.last_damage_t) < 8.0:
+            return None
+
+        if (self.roam_goal is not None and t < self.roam_until
+                and d2((x, y), self.roam_goal) > 12.0
+                and self._inside_predicted_zone(obs, self.roam_goal)):
+            return self.roam_goal
+
+        fc, fr = self._future_circle(obs, 12.0)
+        candidates: List[Tuple[float, Vec2]] = []
+        base = self.rng.random() * PI2
+        for radius in (70.0, 95.0, 120.0, 145.0):
+            for k in range(16):
+                ang = base + PI2 * k / 16.0
+                q = (x + math.cos(ang) * radius, y + math.sin(ang) * radius)
+                if not self._inside_predicted_zone(obs, q):
+                    continue
+                if self.world.ok:
+                    qi = self.world.cell(q[0], q[1])
+                    if self.world.blocked[qi]:
+                        continue
+                enemy_sep = min((d2(q, e['pos']) for e in enemies), default=220.0)
+                if enemy_sep < 95.0:
+                    continue
+                radial = d2(q, fc)
+                if radial > max(0.0, fr - 35.0):
+                    continue
+                cover_count = 0
+                if self.world.ok and enemies:
+                    cover_count, _ = self.world.visible_cover(q, enemies[:3])
+                # Prefer a moderate patrol leg, distance from threats, cover,
+                # and a position not too close to the forecast zone edge.
+                score = (min(enemy_sep, 220.0) * 0.20
+                         + cover_count * 15.0
+                         - abs(radius - 95.0) * 0.16
+                         - max(0.0, radial - fr * 0.58) * 0.10
+                         + self.rng.random() * 3.0)
+                candidates.append((score, q))
+        if not candidates:
+            self.roam_goal = None
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        self.roam_goal = candidates[0][1]
+        self.roam_until = t + 24.0
+        return self.roam_goal
 
     def _navigate(self, me: Dict[str, Any], goal: Vec2, urgent: bool = False) -> Vec2:
         pos = me['pos']
@@ -645,16 +731,35 @@ class Bot:
             r = (dx,dy,target_z-muzzle_z)
             rv = (float(tv[0])-float(mv[0]),float(tv[1])-float(mv[1]),float(tv[2])-float(mv[2]))
             it = solve_intercept(r,rv,speed,2.0)
-            tx += float(tv[0])*it; ty += float(tv[1])*it; target_z += float(tv[2])*it
+            # Aim at future target displacement relative to our moving mech.
+            # This is the correct frame when projectile velocity includes shooter velocity.
+            tx = mx + dx + rv[0]*it
+            ty = my + dy + rv[1]*it
+            target_z = muzzle_z + r[2] + rv[2]*it
         elif kind == 'mortar':
             speed = float(weapon.get('stats',{}).get('speed',72.0))
             g = float(self.cfg.get('weapons',{}).get('mortar',{}).get('gravity',22.0))
-            # Two-pass flight-time lead, with a low-arc solution for quicker hits.
-            flight = min(2.5,horizontal/max(15.0,speed*0.72))
-            tx += float(tv[0])*flight; ty += float(tv[1])*flight; target_z += float(tv[2])*flight
-            dx,dy = tx-mx,ty-my
+            # Iteratively estimate flight time using target velocity relative to us.
+            rvx = float(tv[0]) - float(mv[0])
+            rvy = float(tv[1]) - float(mv[1])
+            rvz = float(tv[2]) - float(mv[2])
+            rx, ry = tx-mx, ty-my
+            flight = min(2.5, horizontal/max(15.0,speed*0.72))
+            for _ in range(2):
+                dx = rx + rvx*flight
+                dy = ry + rvy*flight
+                horizontal = max(0.1,math.hypot(dx,dy))
+                h = target_z - (muzzle_z+2.5) + rvz*flight
+                disc0 = speed**4 - g*(g*horizontal*horizontal+2.0*h*speed*speed)
+                if disc0 > 0.0:
+                    tan0 = (speed*speed-math.sqrt(disc0))/(g*horizontal)
+                    theta0 = math.atan(tan0)
+                    vz0 = speed*math.sin(theta0)
+                    flight = min(2.8, horizontal/max(12.0, speed*math.cos(theta0)))
+            dx = rx + rvx*flight
+            dy = ry + rvy*flight
             horizontal = max(0.1,math.hypot(dx,dy))
-            h = target_z - (muzzle_z+2.5)
+            h = target_z - (muzzle_z+2.5) + rvz*flight
             disc = speed**4 - g*(g*horizontal*horizontal+2.0*h*speed*speed)
             if disc > 0.0:
                 tan_th = (speed*speed-math.sqrt(disc))/(g*horizontal)
@@ -854,7 +959,7 @@ class Bot:
         enemies.sort(key=lambda e:d3(e['pos'],me['pos']))
         self._last_enemies=enemies
         nearest_enemy=self._nearest_enemy_dist(me,enemies)
-        near_count=sum(1 for e in enemies if d3(e['pos'],me['pos'])<105.0)
+        near_count=sum(1 for e in enemies if d3(e['pos'],me['pos'])<125.0)
 
         # Track damage and attacker bearings for armor orientation and disengagement.
         for ev in obs.get('events',[]) or []:
@@ -883,7 +988,9 @@ class Bot:
             goal=zone_goal
             goal_kind='zone'
             move=self._navigate(me,goal,True)
-            urgent_move=True
+            # Zone rotations should be fast on foot but should not automatically
+            # burn the entire energy bar. Reserve boost for actual deadline risk.
+            urgent_move=not me.get('in_zone',True)
             if dodge_urgent:
                 move=unit(move[0]*0.30+dodge[0]*1.45,move[1]*0.30+dodge[1]*1.45)
         elif dodge_urgent:
@@ -938,8 +1045,13 @@ class Bot:
                 goal_kind='retreat'
                 urgent_move=True
             else:
-                goal=(x,y)
-                goal_kind='hold'
+                roam = self._roam_goal(obs, me, enemies, hp_frac)
+                if roam is not None:
+                    goal = roam
+                    goal_kind = 'roam'
+                else:
+                    goal=(x,y)
+                    goal_kind='hold'
             move=self._navigate(me,goal,urgent_move) if d2((x,y),goal)>5.0 else (0.0,0.0)
 
         # Determine a firing target. Avoid long duels while multiple house bots
@@ -1040,15 +1152,24 @@ class Bot:
         moving=math.hypot(move[0],move[1])>0.01
         boost=False
         if moving:
+            walk_speed=float(me.get('stats',{}).get('walk_speed',11.7))
             if urgent_move:
-                throttle=0.92
+                throttle=1.0
             else:
-                walk_speed=float(me.get('stats',{}).get('walk_speed',11.7))
-                step_limit=float(self.cfg.get('sound',{}).get('step_speed',5.0))
-                throttle=min(0.40,max(0.18,(step_limit-0.45)/max(1.0,walk_speed)))
+                # Do not cripple travel speed merely to avoid footsteps. In the
+                # practice mode the squad shares vision, and reaching the next
+                # safe ring on time is more important than staying silent.
+                # Scale down only close to the destination to avoid overshoot.
+                throttle=min(0.92, max(0.42, dist_goal / 38.0))
             move=(move[0]*throttle,move[1]*throttle)
             if urgent_move and energy>18.0:
                 boost=True
+            elif goal_kind=='zone' and energy>58.0 and dist_goal>110.0:
+                # Spend boost only when a long zone rotation warrants it.
+                zone=obs.get('zone',{})
+                deadline=float(zone.get('shrink_start',t))
+                if t>=deadline or dist_goal/max(1.0,walk_speed)>max(0.0,deadline-t)*0.72:
+                    boost=True
         # If in the danger zone, do not conserve energy at the cost of zone damage.
         if not me.get('in_zone',True) and energy>5.0:
             boost=True

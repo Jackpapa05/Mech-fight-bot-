@@ -1,32 +1,19 @@
-# Oval Sentinel V2 — Mech Royale bot
+# Oval Sentinel V3.1
 
-A standard-library-only Python agent for `mechfight/1`.
+Standard-library-only Python bot for `mechfight/1`.
+
+## Changes over V2/V3 candidate
+
+- Proactively moves toward a safe anchor inside the announced next zone, rather than waiting near the outer safe-zone edge.
+- Uses full walk speed for long rotations and scales speed down only near the destination; boosts when an urgent retreat or zone deadline warrants it.
+- Retains the map-aware ground A* navigator, cover evaluation, resource selection, predictive aiming, weapon policy, projectile dodge, upgrade selection and bounded exploration.
 
 ## Build and check
 
-```sh
-python3 -u bot.py
-python3 /path/to/mechfight-kit/check/check.py --map-dir /arena -- python3 -u bot.py
-```
-
-For the competition Docker sandbox, mount the kit's `arena/` folder at `/arena`:
+From this directory:
 
 ```sh
-docker build -t oval-sentinel .
-docker run --rm -i --network none --cpus 1 --memory 512m --read-only \
-  --tmpfs /tmp:rw,size=64m --user 65534:65534 \
-  -v "$PWD/arena:/arena:ro" oval-sentinel
+python3 check/check.py --map-dir /arena -- python3 -u bot.py
 ```
 
-## Strategy
-
-- Quiet movement when there is no immediate danger (keeps ground speed below the step-sound threshold).
-- Zone prediction and urgent zone escape.
-- Static map loading, terrain sampling, obstacle-aware A* ground navigation.
-- Local cover search that evaluates line-of-sight blocking against visible threats.
-- Projectile prediction and emergency dodge/jump.
-- Conservative engagement logic, with disengagement/healing windows.
-- Selective NPC/crate farming, cube and drop prioritisation, and weapon pickups.
-- Predictive gun lead, weapon-specific laser/mortar/lightning choices, and adaptive upgrades.
-
-`check.py` validates protocol compliance and decision latency, not match outcomes. The 48-match practice score is the only evidence that a strategy change improves gameplay. Keep the last best-scoring commit as a fallback.
+The official competition Dockerfile is at the repository root. Copy the contents of this directory to the root of a public GitHub repository.
