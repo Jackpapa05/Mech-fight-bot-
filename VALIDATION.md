@@ -1,69 +1,75 @@
-# V8 validation record
+# Oval Ghost V9 Candidate — Validation
 
-## Reported competitive baseline
+## Baseline
 
-The team reports V7 scored **2.71** in the 48-match practice evaluation. V7 remains the best-known scored build until another scored result exceeds 2.71.
+- V8 is the current best-scoring version with a reported practice score of **2.92**.
+- V9 is an experimental candidate based on V8. No practice score is claimed for V9.
 
 ## Official conformance check
 
-Command:
+Command used:
 
-```sh
-python3 check/check.py --map-dir /path/to/mechfight-kit/arena -- python3 -u bot.py
+```bash
+python3 /path/to/mechfight-kit/check/check.py \
+  --map-dir /mnt/data/arena_local/arena \
+  -- python3 -u bot.py
 ```
 
-Result in this environment:
+Latest run:
 
-- 300 / 300 observations answered
-- 0 missed 50 ms deadlines
-- 0 late answers
-- 0 wrong ticks
-- 0 malformed protocol lines
-- 0 debug-cap violations
-- Response time: p50 0.6 ms, p90 1.3 ms, p99 1.9 ms, max 6.3 ms
 - Result: PASS
+- Observations: 300/300
+- Missed 50 ms deadlines: 0
+- Wrong ticks: 0
+- Bad protocol lines: 0
+- p50: 1.6 ms
+- p90: 2.3 ms
+- p99: 2.8 ms
+- Max: 44.6 ms (single-machine wall-time outlier; no deadline was missed)
 
-These are local measurements, not the official Docker sandbox's timing.
+The official checker verifies protocol and runtime behaviour, not match placement. This was not a Docker-sandbox run.
 
-## Focused regression tests
+## Integrated real-arena tests
 
-`python3 test_v8.py`:
+Command:
 
-- Reproduces a mortar path with an actual 8.95 m closest approach against a 9.0 m danger threshold; V7's coarse-sample distance misses it, V8's refined-distance recomputation detects it.
-- Confirms straight bullets whose trajectory is blocked by a solid/terrain ray do not trigger a dodge.
-- Confirms visible beam source records shooter ID and direction.
-- Confirms an older sound does not overwrite a newer beam threat.
+```bash
+MECHFIGHT_ARENA=/path/to/arena python3 -m unittest test_v9_integrated.py -v
+```
 
-Result: 4 tests passed.
+Result: **8/8 PASS**.
 
-## Synthetic stress test
+Tests cover:
 
-A local 150-tick stress harness with 15 visible mechs, 12 NPCs, 50 projectiles, 12 sounds, and 8 beams measured:
+- Actual 259 prisms, 1,560 trees, and 774,680 terrain samples loaded through the V8 bot.
+- Tree crown vision blocking while weapon LOS remains unblocked by trees.
+- Third-party beam filtering and near-self beam threat detection.
+- Straight projectile occlusion and danger evaluation.
+- Mortar early-ground-impact splash response.
+- Integrated 24-direction steering stress using real V8 geometry methods.
 
-- p50: 0.178 ms
-- p90: 0.234 ms
-- p99: 0.297 ms
-- max: 0.364 ms
+Integrated steering stress: p50 5.25 ms, p99 5.94 ms, max 5.94 ms in the local process.
 
-This was a Python `act()` microbenchmark using synthetic observations and the local map, not a full Docker run.
+## Gemini reference subsystem tests
 
-## Not yet verified
+Command:
 
-- V8 has not received a 48-match practice score.
-- Docker build/run was not performed because Docker is unavailable in this environment.
-- Gun-projectile shooter-velocity inheritance remains unspecified by the protocol and unverified empirically; V8 keeps V7's current internally consistent assumption.
-- Projectile occlusion uses a straight ray for gun/NPC bullets. It is intentionally not applied to ballistic mortars.
+```bash
+MECHFIGHT_ARENA=/path/to/arena python3 -m unittest test_v9_reference.py -v
+```
 
-## V7 vs V8 action comparison on the supplied 300-observation replay
+Result: **4/4 PASS**. This is a supplementary subsystem test. Its `RealArenaMockBot` intentionally stubs collision and terrain path methods; use `test_v9_integrated.py` for tests invoking the actual bot geometry.
 
-Both bots were run sequentially over the same observations with their own persistent state. Results:
+## Important limitations
 
-- Observations containing beams: 5 / 300
-- Projectiles in the replay: 30 gun projectiles; no mortar projectiles
-- Different movement commands: 0
-- Different boost commands: 0
-- Different fire commands: 0
-- Different jump commands: 0
-- Different aim commands: 1
+- This is not a scored 48-match result.
+- Docker was not available in the local environment, so the exact 1-CPU / 512 MB / read-only container run was not reproduced.
+- The coarse A* graph is a bounded, throttled fallback, not a fully precomputed global traversability map.
+- Rooftop reachability is not yet connected to a full jump/jet route planner.
+- Tree visibility uses a vertical-cylinder approximation and a short-horizon movement bonus; it is not an exact recreation of the server's complete vision engine.
+- Mortar impact points are estimated from short trajectory segments and local map geometry.
+- Gun projectile shooter-velocity inheritance remains unverified from public protocol information.
 
-This is useful for confirming that the narrow patch does not broadly alter V7's recorded behaviour. It also means the supplied replay does **not** exercise the mortar-CPA fix, and scored games are needed to determine whether the new handling improves placements.
+## Promotion rule
+
+Do not replace V8's 2.92 as the best submission unless V9 achieves a strictly higher practice score.

@@ -1,25 +1,29 @@
-# Oval Ghost V8 — focused threat-awareness candidate
+# Oval Ghost V9 — Integrated Context-Steering Candidate
 
-V8 is a narrow experimental patch based on V7 (practice score reported by the team: 2.71). It does **not** replace the best-known V7 build until V8 receives its own 48-match score.
+V9 is an experimental candidate built on the V8 bot, which currently has a reported practice score of **2.92**. It preserves V8's target selection, weapons, aiming, laser safety, upgrades, and resource-goal logic while adding Gemini's tactical movement/perception subsystems.
 
-## Changes from V7
+## Files
 
-1. **Mortar CPA consistency:** after refining the closest-approach time from the 50 ms samples, recompute the true 3D separation and lateral dodge vector at that refined time. V7 refined time but retained distance/direction from the coarse sample.
-2. **Projectile path occlusion:** for straight gun/NPC bullets, do not dodge when the projectile's current path to its predicted closest-approach point is blocked by a solid or terrain ridge. This is separate from tree vision because trees do not block shots.
-3. **Beam-based threat memory:** use observed laser/lightning beam source positions and shooter IDs to update the threat bearing when the beam is newer than existing damage/sound evidence. This helps orient toward the attacker when no mech is currently visible.
-4. **Timestamp ordering:** older sounds do not overwrite a newer beam/damage observation.
+- `bot.py` — V8 combat base with V9 movement and threat tracking integrated.
+- `v9_core.py` — tree visibility index, multimodal threat tracker, projectile danger evaluator, 24-direction context steering, and bounded coarse A* fallback.
+- `mechfight.py` — official standard-library protocol wrapper.
+- `Dockerfile` — competition container entrypoint.
+- `test_v9_integrated.py` — integration tests using actual V8 map/collision/terrain methods and extracted arena files.
+- `test_v9_reference.py` — Gemini's reference subsystem test/benchmark.
+- `AUDIT_NOTES.md`, `VALIDATION.md` — engineering notes and validation results.
 
-## Deliberately not included
+## Local validation
 
-No new 24-direction steering, ORCA, rooftop planner, tree-vision model, or large strategy rewrite is included. Those need separate testing. This candidate preserves V7's broader action policy.
+From the project directory:
 
-## Build and test
-
-```sh
-python3 check/check.py --map-dir /path/to/mechfight-kit/arena -- python3 -u bot.py
-python3 test_v8.py
+```bash
+python3 /path/to/mechfight-kit/check/check.py --map-dir /path/to/arena -- python3 -u bot.py
+MECHFIGHT_ARENA=/path/to/arena python3 -m unittest test_v9_integrated.py -v
+MECHFIGHT_ARENA=/path/to/arena python3 -m unittest test_v9_reference.py -v
 ```
 
-## Submission policy
+The submitted repository should have `Dockerfile` at its root. Upload the contents of this directory, not the ZIP file itself.
 
-V7's reported score of 2.71 remains the best-known result until V8's scored practice result is higher. The conformance check is not a gameplay simulation.
+## Caution
+
+V9 has passed local protocol and integration tests, but **has not yet produced a scored practice result**. Keep V8 (2.92) as the selected best until V9 scores higher. The official checker validates protocol/timing, not gameplay placement.

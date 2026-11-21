@@ -10,6 +10,7 @@ from array import array
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import mechfight as mf
+from v9_core import CoarseNavGraph, ContextSteerer, ThreatTracker, TreeIndex
 
 Vec2 = Tuple[float, float]
 Vec3 = Tuple[float, float, float]
@@ -100,7 +101,7 @@ def solve_intercept(r: Vec3, v: Vec3, speed: float, max_t: float = 2.5) -> float
 
 
 class Bot:
-    name = "Oval-Ghost-v8-cpa-beam"
+    name = "Oval-Ghost-v9-context-steering"
 
     def __init__(self, hello: mf.Hello):
         self.hello = hello
@@ -121,6 +122,10 @@ class Bot:
         self.bin_size = 32.0
         self.terrain_values: Optional[array] = None
         self.terrain_meta: Dict[str, Any] = {}
+        self.tree_index: Optional[TreeIndex] = None
+        self.threat_tracker = ThreatTracker()
+        self.nav_graph = CoarseNavGraph(self)
+        self.context_steerer = ContextSteerer(nav=self.nav_graph)
         self._load_map()
 
     def _load_map(self) -> None:
@@ -130,6 +135,7 @@ class Bot:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 world = json.load(f)
+            self.tree_index = TreeIndex(world)
             for p in world.get("prisms", []):
                 ring = p.get("ring") or []
                 if len(ring) < 6:
@@ -488,29 +494,33 @@ class Bot:
 
 
     def _remember_beams(self, obs: mf.Observation, me: Dict[str, Any], now: float) -> None:
-        """Use visible laser/lightning beams to remember the firing direction.
+        """Remember only beams whose path passed close enough to threaten us.
 
-        Beam paths begin at the shooter's muzzle and include the shooter ID.
-        This complements damage events: a beam can be visible even when it
-        misses, giving us an early direction to face if no mech is currently
-        visible. Trees do not block shots, so this is independent of tree cover.
+        A beam from a distant third-party duel must not overwrite our defensive
+        bearing or mark its shooter as our last attacker.
         """
         mx, my, _ = me.get("pos", [0.0, 0.0, 0.0])
+        my_id = me.get("id")
         candidates = []
         for beam in obs.get("beams", []) or []:
             kind = str(beam.get("kind", ""))
             age = float(beam.get("age", 99.0))
             path = beam.get("path") or []
-            if kind not in ("laser", "lightning") or not path or age > 1.0:
+            by = beam.get("by")
+            if kind not in ("laser", "lightning") or len(path) < 2 or age > 1.0:
                 continue
-            src = path[0]
-            if not isinstance(src, (list, tuple)) or len(src) < 2:
+            if by is not None and my_id is not None and int(by) == int(my_id):
+                continue
+            src, dst = path[0], path[-1]
+            if len(src) < 2 or len(dst) < 2:
+                continue
+            beam_dist = point_segment_distance(
+                float(mx), float(my), float(src[0]), float(src[1]), float(dst[0]), float(dst[1])
+            )
+            if beam_dist > 35.0:
                 continue
             dx, dy = float(src[0]) - float(mx), float(src[1]) - float(my)
-            distance = math.hypot(dx, dy)
-            bearing = math.atan2(dy, dx)
-            candidates.append((now - age, distance, bearing, kind, beam.get("by")))
-        # Prefer the most recent beam; if timestamps tie, prefer the nearer source.
+            candidates.append((now - age, math.hypot(dx, dy), math.atan2(dy, dx), kind, by))
         if not candidates:
             return
         beam_t, distance, bearing, kind, by = max(candidates, key=lambda q: (q[0], -q[1]))
@@ -526,6 +536,7 @@ class Bot:
                 self.last_attacker_id = int(by)
             except (TypeError, ValueError):
                 pass
+
 
     def _zone_goal(self, obs: mf.Observation, me: Dict[str, Any]) -> Vec2:
         z = obs.get("zone", {})
@@ -977,6 +988,8 @@ class Bot:
         me = obs["self"]
         x, y, z = me["pos"]
         t = float(obs.get("t", 0.0))
+        self.threat_tracker.update(obs, me)
+        prioritized_threats = self.threat_tracker.prioritized_threats(obs, me)
         actors = obs.get("mechs", []) or []
         enemies = [m for m in actors if m.get("kind") == "mech"]
         npcs = [m for m in actors if m.get("kind") == "npc"]
@@ -1196,6 +1209,10 @@ class Bot:
                 if ev.get("type") == "damaged" and ev.get("bearing") is not None and ev.get("weapon") != "zone":
                     bearing = float(ev["bearing"])
                     break
+            tracker_bearing = self.threat_tracker.defensive_bearing
+            tracker_age = t - self.threat_tracker.defensive_bearing_t
+            if bearing is None and tracker_bearing is not None and 0.0 <= tracker_age < 1.5:
+                bearing = tracker_bearing
             if bearing is None and self.last_threat_bearing is not None and t - self.last_threat_t < 2.0:
                 bearing = self.last_threat_bearing
             if bearing is not None:
@@ -1205,27 +1222,29 @@ class Bot:
         if w0 and float(w0.get("ammo", 1.0)) <= 0.0 and float(w0.get("reload", 0.0)) <= 0.0:
             action["reload"] = True
 
-        # Movement: resource/zone objective, local wall avoidance, and threat response.
-        move = self._steer(me, goal)
-        dodge, urgent, jump = self._incoming_threat(obs, me)
+        # V9 movement: 24-direction interest/danger steering with map geometry,
+        # projectile VO and a limited cover/retreat preference. Keep V8 combat.
+        _, _, jump = self._incoming_threat(obs, me)  # retain V8's jump response
+        strafe_vec: Optional[Vec2] = None
+        strafe_weight = 0.0
+        if nearby:
+            nearest = min(nearby, key=lambda e: dist3(e["pos"], me["pos"]))
+            ex, ey = unit(x - float(nearest["pos"][0]), y - float(nearest["pos"][1]))
+            nd = dist2((x, y), nearest["pos"])
+            if hp_frac < 0.58 or len(nearby) >= 3:
+                strafe_vec = (ex, ey)
+                strafe_weight = 1.2 if hp_frac < 0.58 else 0.75
+            elif nd < 85.0:
+                strafe_vec = (-ey * self.strafe_sign, ex * self.strafe_sign)
+                strafe_weight = 0.75
+
+        move, urgent = self.context_steerer.evaluate(
+            self, obs, me, goal, 1.0, prioritized_threats, strafe_vec, strafe_weight
+        )
         boost = False
         if urgent:
-            move = unit(move[0] * 0.25 + dodge[0] * 1.5, move[1] * 0.25 + dodge[1] * 1.5)
             boost = energy > 12.0
         else:
-            # Avoid being surrounded or chased when health is low. In healthier
-            # states, orbit the nearest attacker to make leading shots harder.
-            if nearby:
-                nearest = min(nearby, key=lambda e: dist3(e["pos"], me["pos"]))
-                ex, ey = unit(x - nearest["pos"][0], y - nearest["pos"][1])
-                nd = dist2((x, y), nearest["pos"])
-                if hp_frac < 0.58 or len(nearby) >= 3:
-                    weight = 1.2 if hp_frac < 0.58 else 0.75
-                    move = unit(move[0] + ex * weight, move[1] + ey * weight)
-                elif nd < 85.0:
-                    tangent = (-ey * self.strafe_sign, ex * self.strafe_sign)
-                    move = unit(move[0] * 0.65 + tangent[0] * 0.75, move[1] * 0.65 + tangent[1] * 0.75)
-            # Use boost sparingly: zone escape and short high-value rotations.
             dist_goal = dist2((x, y), goal)
             outside = not me.get("in_zone", True)
             boost = energy > 48.0 and (outside or (dist_goal > 90.0 and energy > 72.0))
