@@ -10,7 +10,9 @@ from array import array
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import mechfight as mf
-from v9_core import CoarseNavGraph, ContextSteerer, ThreatTracker, TreeIndex
+from v9_core import (CoarseNavGraph, ContextSteerer, ThreatTracker, TreeIndex,
+                     choose_defensive_aim, choose_supply_drop_goal,
+                     should_suppress_optional_fire)
 
 Vec2 = Tuple[float, float]
 Vec3 = Tuple[float, float, float]
@@ -101,7 +103,7 @@ def solve_intercept(r: Vec3, v: Vec3, speed: float, max_t: float = 2.5) -> float
 
 
 class Bot:
-    name = "Oval-Ghost-v9-context-steering"
+    name = "Oval-Ghost-v9.1-tactical"
 
     def __init__(self, hello: mf.Hello):
         self.hello = hello
@@ -1047,16 +1049,35 @@ class Bot:
                     target = rear_attacker
                     self.last_target = rear_attacker_id
 
+        # Optional farming is deferred while damaged and recovering. This gate
+        # never applies to a visible hostile mech, so self-defence is preserved.
+        suppress_optional_fire = should_suppress_optional_fire(
+            me, has_visible_enemy=bool(enemies) or recent_alert
+        )
+
         # Opportunistic drone farming: two cubes are valuable, but do not detour
-        # toward a drone while a mech is close or directional weapon sounds are recent.
+        # toward a drone while a mech is close, threat sounds are recent, or
+        # optional damage would reset a useful regeneration window.
         if (target is None and npcs and nearest_npc_dist < 68.0
                 and nearest_enemy_dist > 145.0 and hp_frac > 0.66
-                and me.get("in_zone", True) and not recent_alert):
+                and me.get("in_zone", True) and not recent_alert
+                and not suppress_optional_fire):
             target = npcs[0]
 
         zone_goal = self._zone_goal(obs, me)
         resource_goal, resource_obj, resource_kind = self._choose_resource_goal(obs, me, enemies, zone_goal)
         goal = resource_goal
+        movement_goal_weight = 1.0
+
+        # Pre-rotate toward a safe, upcoming supply drop. Existing cover and
+        # zone-emergency decisions below retain priority over this opportunity.
+        drop_choice = None
+        if nearest_enemy_dist > 65.0 and not recent_alert:
+            drop_choice = choose_supply_drop_goal(obs, me, prioritized_threats)
+        if drop_choice is not None:
+            goal, movement_goal_weight = drop_choice
+            resource_obj = None
+            resource_kind = "drop_preposition"
 
         # Use cover only when there is a concrete reason: close line-of-sight threats,
         # multiple nearby mechs, or very recent damage. This changes movement, not firing.
@@ -1067,6 +1088,7 @@ class Bot:
         cover_goal = self._cover_goal(obs, me, exposed_threats) if (cover_trigger and exposed_threats) else None
         if cover_goal is not None:
             goal = cover_goal
+            movement_goal_weight = 1.0
             resource_obj = None
             resource_kind = "cover"
 
@@ -1075,17 +1097,24 @@ class Bot:
         recovering = (hp_frac < 0.78 and (t - self.last_damage_t) >= 5.0
                       and not enemies and me.get("in_zone", True)
                       and not recent_alert and nearest_npc_dist > 75.0)
-        if recovering and cover_goal is None:
+        if recovering and cover_goal is None and drop_choice is None:
             # Movement itself does NOT reset regeneration. Keep rotating toward
             # safety instead of becoming a stationary target while healing.
             goal = zone_goal
+            movement_goal_weight = 1.0
             resource_obj = None
             resource_kind = "recover"
+        elif suppress_optional_fire and target is None and resource_kind == "crate" and drop_choice is None and cover_goal is None:
+            goal = zone_goal
+            movement_goal_weight = 1.0
+            resource_obj = None
+            resource_kind = "regen_hold"
 
         # If a crate was selected, shoot it while moving toward it. Crate fire is
         # deliberately lower priority than any visible hostile mech.
         utility_target = None
-        if target is None and resource_kind == "crate" and not recovering:
+        if (target is None and resource_kind == "crate" and not recovering
+                and not suppress_optional_fire):
             utility_target = resource_obj
 
         # Aim/weapon choice.
@@ -1215,6 +1244,8 @@ class Bot:
                 bearing = tracker_bearing
             if bearing is None and self.last_threat_bearing is not None and t - self.last_threat_t < 2.0:
                 bearing = self.last_threat_bearing
+            if bearing is None:
+                bearing = choose_defensive_aim(t, me, self.threat_tracker, prioritized_threats)
             if bearing is not None:
                 aim_yaw, aim_pitch = bearing, 0.0
 
@@ -1239,7 +1270,7 @@ class Bot:
                 strafe_weight = 0.75
 
         move, urgent = self.context_steerer.evaluate(
-            self, obs, me, goal, 1.0, prioritized_threats, strafe_vec, strafe_weight
+            self, obs, me, goal, movement_goal_weight, prioritized_threats, strafe_vec, strafe_weight
         )
         boost = False
         if urgent:

@@ -701,3 +701,126 @@ def rooftop_reachable(prism: Dict[str, Any], ground_z: float, energy: float) -> 
     if rise <= 1.2:
         return True
     return energy >= 75.0 and rise <= min(45.0, energy * 0.50)
+
+def choose_supply_drop_goal(
+    obs: Dict[str, Any],
+    me: Dict[str, Any],
+    threats: Sequence[Dict[str, Any]],
+) -> Optional[Tuple[Vec2, float]]:
+    """Choose a conservative pre-rotation target for a safe supply drop.
+
+    Unlike a raw nearest-drop rule, this rejects drops held by another mech,
+    drops outside the next safe circle, and drops with a recently tracked
+    opponent close to the capture ring. It only proposes a goal; cover and
+    zone-emergency logic in Bot.act may still override it.
+    """
+    pos = me.get("pos", (0.0, 0.0, 0.0))
+    mx, my = float(pos[0]), float(pos[1])
+    my_id = me.get("id")
+    hp = float(me.get("hp", 1400.0))
+    max_hp = max(1.0, float(me.get("max_hp", 1400.0)))
+    energy = float(me.get("energy", 0.0))
+    max_energy = max(1.0, float(me.get("max_energy", 100.0)))
+    cubes = int(me.get("cubes", 0))
+
+    # A full-health, full-energy mech already at the damage cube cap gains less
+    # from an expensive detour (extra cubes still enlarge its hitbox).
+    if hp / max_hp >= 0.97 and energy / max_energy >= 0.90 and cubes >= 10:
+        return None
+
+    zone = obs.get("zone", {}) or {}
+    next_center = zone.get("next_center", zone.get("center", (mx, my)))
+    next_radius = float(zone.get("next_radius", zone.get("radius", 1e9)))
+    walk_speed = float((me.get("stats", {}) or {}).get("walk_speed", 11.7))
+    boost_speed = float((me.get("stats", {}) or {}).get("boost_speed", 19.5))
+    # Use a conservative effective speed; the movement policy may reserve boost.
+    effective_speed = max(walk_speed, boost_speed * (0.72 if energy >= 45.0 else 0.0))
+
+    best_goal: Optional[Vec2] = None
+    best_score = 0.0
+    now = float(obs.get("t", 0.0))
+    for drop in obs.get("drops", []) or []:
+        lands_in = float(drop.get("lands_in", 9999.0))
+        if lands_in < 0.0 or lands_in > 13.0:
+            continue
+        holder = drop.get("holder")
+        if holder is not None and holder != my_id:
+            continue
+        p = drop.get("pos") or (mx, my, 0.0)
+        gx, gy = float(p[0]), float(p[1])
+        distance = math.hypot(gx - mx, gy - my)
+        max_dist = 210.0 if lands_in <= 0.0 else 165.0
+        if distance > max_dist:
+            continue
+        # Do not chase a drop that cannot plausibly be reached before it lands
+        # plus the four-second capture period. A landed drop can be approached
+        # later because it remains in the world until collected.
+        if lands_in > 0.0 and effective_speed > 1.0:
+            if distance / effective_speed > lands_in + 4.0:
+                continue
+        # Drops are placed inside the future ring. Keep a margin to avoid routing
+        # to the shrinking edge if the zone metadata is available.
+        if next_radius < 1e8:
+            if math.hypot(gx - float(next_center[0]), gy - float(next_center[1])) > max(0.0, next_radius - 8.0):
+                continue
+        nearby_threats = 0
+        very_close = False
+        for th in threats:
+            tp = th.get("pos") or (1e9, 1e9, 0.0)
+            age = max(0.0, now - float(th.get("last_seen_t", now)))
+            if age > 2.5:
+                continue
+            td = math.hypot(float(tp[0]) - gx, float(tp[1]) - gy)
+            if td < 55.0:
+                nearby_threats += 1
+            if td < 32.0:
+                very_close = True
+        if very_close or nearby_threats >= 2:
+            continue
+
+        hp_need = 1.0 - hp / max_hp
+        energy_need = 1.0 - energy / max_energy
+        cube_value = 1.0 if cubes < 10 else 0.15
+        score = (120.0 + 65.0 * hp_need + 32.0 * energy_need
+                 + 24.0 * cube_value - 0.58 * distance
+                 - 24.0 * nearby_threats)
+        if holder == my_id:
+            score += 70.0
+        if score > best_score:
+            best_score = score
+            best_goal = (gx, gy)
+    return (best_goal, 1.10) if best_goal is not None else None
+
+
+def choose_defensive_aim(
+    now: float,
+    me: Dict[str, Any],
+    tracker: ThreatTracker,
+    threats: Sequence[Dict[str, Any]],
+) -> Optional[float]:
+    """Return a fresh incoming-threat bearing, or a very recent tracked target.
+
+    We intentionally reject old five-second visual memories as a defensive
+    facing command: stale bearings can turn rear armour toward a newer attacker.
+    """
+    bearing = tracker.defensive_bearing
+    age = now - tracker.defensive_bearing_t
+    if bearing is not None and 0.0 <= age <= 1.25:
+        return float(bearing)
+    for threat in threats:
+        seen_age = now - float(threat.get("last_seen_t", -999.0))
+        if 0.0 <= seen_age <= 1.25:
+            tp = threat.get("pos")
+            if tp and len(tp) >= 2:
+                return math.atan2(float(tp[1]) - float(me["pos"][1]),
+                                  float(tp[0]) - float(me["pos"][0]))
+    return None
+
+
+def should_suppress_optional_fire(me: Dict[str, Any], has_visible_enemy: bool) -> bool:
+    """Avoid optional NPC/crate damage while recovering, never suppress self-defence."""
+    if has_visible_enemy:
+        return False
+    hp = float(me.get("hp", 1400.0))
+    max_hp = max(1.0, float(me.get("max_hp", 1400.0)))
+    return (hp / max_hp) < 0.85

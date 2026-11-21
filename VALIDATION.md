@@ -1,75 +1,58 @@
-# Oval Ghost V9 Candidate — Validation
+# Oval Ghost V9.1 — Validation record
 
-## Baseline
+## Candidate status
 
-- V8 is the current best-scoring version with a reported practice score of **2.92**.
-- V9 is an experimental candidate based on V8. No practice score is claimed for V9.
+V9.1 is unscored. Current reported best remains V8 at 2.92.
 
 ## Official conformance check
 
-Command used:
-
-```bash
-python3 /path/to/mechfight-kit/check/check.py \
-  --map-dir /mnt/data/arena_local/arena \
-  -- python3 -u bot.py
-```
-
-Latest run:
-
-- Result: PASS
-- Observations: 300/300
-- Missed 50 ms deadlines: 0
-- Wrong ticks: 0
-- Bad protocol lines: 0
-- p50: 1.6 ms
-- p90: 2.3 ms
-- p99: 2.8 ms
-- Max: 44.6 ms (single-machine wall-time outlier; no deadline was missed)
-
-The official checker verifies protocol and runtime behaviour, not match placement. This was not a Docker-sandbox run.
-
-## Integrated real-arena tests
-
 Command:
 
 ```bash
-MECHFIGHT_ARENA=/path/to/arena python3 -m unittest test_v9_integrated.py -v
+python3 /path/to/mechfight-kit/check/check.py --map-dir /mnt/data/arena_local/arena -- python3 -u bot.py
 ```
 
-Result: **8/8 PASS**.
+Latest local result:
 
-Tests cover:
+- PASS
+- 300/300 observations answered
+- 0 missed 50 ms deadlines
+- 0 wrong ticks
+- 0 bad protocol lines
+- 0 over-cap debug drawings
+- p50 1.7 ms, p90 2.3 ms, p99 3.0 ms, max 43.8 ms (single local machine; not the 1-CPU Docker sandbox)
 
-- Actual 259 prisms, 1,560 trees, and 774,680 terrain samples loaded through the V8 bot.
-- Tree crown vision blocking while weapon LOS remains unblocked by trees.
-- Third-party beam filtering and near-self beam threat detection.
-- Straight projectile occlusion and danger evaluation.
-- Mortar early-ground-impact splash response.
-- Integrated 24-direction steering stress using real V8 geometry methods.
-
-Integrated steering stress: p50 5.25 ms, p99 5.94 ms, max 5.94 ms in the local process.
-
-## Gemini reference subsystem tests
-
-Command:
+## Real-map integrated tests
 
 ```bash
-MECHFIGHT_ARENA=/path/to/arena python3 -m unittest test_v9_reference.py -v
+MECHFIGHT_ARENA=/mnt/data/arena_local/arena python3 -m unittest test_v9_integrated.py -v
 ```
 
-Result: **4/4 PASS**. This is a supplementary subsystem test. Its `RealArenaMockBot` intentionally stubs collision and terrain path methods; use `test_v9_integrated.py` for tests invoking the actual bot geometry.
+- 8/8 passed
+- Uses actual V8 bot geometry, 259 prisms, 1,560 trees and 774,680 terrain samples
+- Integrated steering stress: p50 5.286 ms, max 12.860 ms in this run
 
-## Important limitations
+## Gemini reference tests
 
-- This is not a scored 48-match result.
-- Docker was not available in the local environment, so the exact 1-CPU / 512 MB / read-only container run was not reproduced.
-- The coarse A* graph is a bounded, throttled fallback, not a fully precomputed global traversability map.
-- Rooftop reachability is not yet connected to a full jump/jet route planner.
-- Tree visibility uses a vertical-cylinder approximation and a short-horizon movement bonus; it is not an exact recreation of the server's complete vision engine.
-- Mortar impact points are estimated from short trajectory segments and local map geometry.
-- Gun projectile shooter-velocity inheritance remains unverified from public protocol information.
+```bash
+MECHFIGHT_ARENA=/mnt/data/arena_local/arena python3 -m unittest test_v9_reference.py -v
+```
 
-## Promotion rule
+- 4/4 passed
+- Its mock bot stubs collision, terrain-clearance and ray-blocking methods; these are supplementary algorithm tests, not proof of real navigation geometry.
 
-Do not replace V8's 2.92 as the best submission unless V9 achieves a strictly higher practice score.
+## Added tactical helper tests
+
+```bash
+python3 -m unittest test_v9_tactical.py -v
+```
+
+- 5/5 passed
+- Covers safe supply-drop selection, contested/held drop rejection, next-zone check, optional-fire suppression, and stale defensive-bearing rejection.
+
+## Limitations
+
+- No Docker binary was available; exact 1 CPU / 512 MB / read-only container run is not reproduced.
+- No scored 48-match result exists yet.
+- Rooftop reachability remains advisory, not a full jet-assisted navigation planner.
+- The official checker does not simulate action consequences.

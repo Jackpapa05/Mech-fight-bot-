@@ -1,31 +1,19 @@
-# V9 Candidate Notes
+# V9.1 integration notes
 
-## Base and scope
+Base: V8 combat policy + existing V9 integrated movement/perception candidate. Latest Gemini V9 helpers have been integrated selectively.
 
-- Base: V8 source (`Oval-Ghost-v8-cpa-beam`), current reported practice score 2.92.
-- Integrated Gemini's `v9_core.py` into a separate candidate; main was not modified.
-- Preserves V8 target selection, weapon selection, aiming, laser safety, upgrades, and resource goal selection.
-- Movement is replaced with 24-direction context steering and 5-second threat tracking.
+## Added in V9.1
 
-## Independent changes applied during integration
+1. Conservative supply-drop pre-rotation (`choose_supply_drop_goal`): only drops landing within 13 seconds or already landed; rejects drops held by another mech; rejects drops outside the next safe circle; rejects very-close or multiple nearby tracked threats; estimates reachability; scores missing HP, energy and cube value. Existing cover and zone-emergency logic retain priority.
+2. Defensive aim helper: uses fresh defensive bearing and very recent tracked enemies only; rejects stale five-second enemy memory as a torso-facing command.
+3. Optional-fire suppression: below 85% HP with no visible mech or near/mid recent alert, do not farm NPCs or crates, preserving the regeneration window. This does not suppress visible-mech self-defence.
 
-1. Fixed V8 beam-memory false attribution: only beams whose path passes within 35 m of our mech can change defensive bearing/last-attacker memory; own beams are ignored.
-2. Improved TreeIndex ray testing using segment/vertical-cylinder parameter intervals, accounting for crown offsets and partial vertical overlap.
-3. Added small tree-concealment interest bonus to movement decisions. Trees remain vision-only and never block weapon rays.
-4. Projectile occlusion is evaluated per candidate direction at that candidate's CPA; mortar is never culled by straight-line LOS.
-5. Mortar danger path is sampled at 50 ms and truncated on terrain or prism impact before evaluating splash.
-6. Coarse A* avoids map-out-of-bounds cells, disallows diagonal corner cutting, checks terrain edges, caches by goal, and returns the immediate next waypoint.
-7. A* expansion budget limited to 180 per replan to reduce tail latency.
-8. Distant sounds do not set the threat tracker's defensive bearing (they remain available to V8's original sound handler).
+## Deliberately not integrated
 
-## Known limitations / not yet integrated
+- No automatic rooftop route/jet climb. `rooftop_reachable` remains advisory only.
+- No blind supply-drop contesting against a known holder.
+- No optional-fire suppression against visible hostile mechs.
 
-- Rooftop reachability helper remains advisory and does not command jump/jet navigation or guarantee a traversable approach.
-- Tree concealment bonus is a short-horizon heuristic, not a full multi-enemy shared-vision simulator.
-- A* is lazy/throttled, not a full precomputed traversability grid.
-- Mortar impact is approximated by 50 ms trajectory segments and the bot's ray/terrain geometry; impact damage/splash can still be imperfect near complex prism edges.
-- Shooter-velocity inheritance for gun bullets remains unverified by the public protocol.
+## Known caveat
 
-## Scoring policy
-
-V8 score 2.92 remains the benchmark. Do not promote V9 unless its actual practice score is strictly greater than 2.92.
+The helper's threat/zone/travel filters are conservative heuristics, not a full drop-capture planner. Practice score must decide whether the feature helps.
